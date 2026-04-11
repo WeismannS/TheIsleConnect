@@ -1,6 +1,8 @@
 # The Isle Auto-Connect
 
-Automated server reconnection bot for The Isle.
+Automatically retry and reconnect to your favorite The Isle server when it opens up. No more sitting there hitting refresh.
+
+The Isle removed the server queue system. Now you have to manually retry until you get in. This bot does that for you automatically.
 
 ## Setup
 
@@ -27,9 +29,10 @@ pip install -r requirements.txt
 Set Windows screen scaling to 100% in Display settings.
 
 To change the target server:
-1. Take a screenshot of your server's name in-game
-2. Save it as `assets/targets/bosch.png` (or any name)
-3. Open `main.py` and change `TARGET = "bosch.png"` to match your filename
+1. Favorite only your target server
+2. Take a screenshot of your server's name in-game
+3. Save it as `assets/targets/bosch.png` (or any name)
+4. Open `main.py` and change `TARGET = "bosch.png"` to match your filename
 
 ### 6. Run
 ```cmd
@@ -44,11 +47,9 @@ The bot monitors your screen for UI elements and automatically:
 - Connects to the server
 - Dismisses connection errors and reconnects
 
-This is essentially a smart macro.
+## Tips
 
-## Target Selection
-
-Template matching is not perfectly accurate and may select a wrong server. For reliable targeting:
+For reliable targeting:
 1. Favorite only your target server
 2. Set screen scaling to 100%
 3. Keep the game window in a consistent position
