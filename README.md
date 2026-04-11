@@ -26,7 +26,7 @@ pip install -r requirements.txt
 ```
 
 ### 5. Configure
-Set Windows screen scaling to 100% in Display settings.
+Set game to fullscreen
 
 To change the target server:
 1. Favorite only your target server
@@ -51,5 +51,4 @@ The bot monitors your screen for UI elements and automatically:
 
 For reliable targeting:
 1. Favorite only your target server
-2. Set screen scaling to 100%
-3. Keep the game window in a consistent position
+2. Keep the game window in a consistent position
