@@ -4,17 +4,37 @@ Automated server reconnection bot for The Isle.
 
 ## Setup
 
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 1. Install Python
+Download Python from the Microsoft Store (search "Python 3.14") and install it.
 
-2. Set Windows screen scaling to 100%.
+### 2. Create a virtual environment
+Open Command Prompt in this folder and run:
+```cmd
+python -m venv .venv
+```
 
-4. Run:
-   ```bash
-   python main.py
-   ```
+### 3. Activate the virtual environment
+```cmd
+.venv\Scripts\activate
+```
+
+### 4. Install dependencies
+```cmd
+pip install -r requirements.txt
+```
+
+### 5. Configure
+Set Windows screen scaling to 100% in Display settings.
+
+To change the target server:
+1. Take a screenshot of your server's name in-game
+2. Save it as `assets/targets/bosch.png` (or any name)
+3. Open `main.py` and change `TARGET = "bosch.png"` to match your filename
+
+### 6. Run
+```cmd
+python main.py
+```
 
 ## How it works
 
@@ -24,13 +44,7 @@ The bot monitors your screen for UI elements and automatically:
 - Connects to the server
 - Dismisses connection errors and reconnects
 
-This is essentially a smart macro
-## Configuration
-
-Edit `main.py` to change:
-- `confidence` - Template matching sensitivity (0.0-1.0)
-- `grayscale` - Toggle color mode for matching
-- Target server by updating `assets/targets/target.png`
+This is essentially a smart macro.
 
 ## Target Selection
 
