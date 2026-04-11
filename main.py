@@ -67,7 +67,7 @@ def main():
 
         while is_onscreen(favoritetab_img) and is_onscreen(connect_img):
             click_asset("refresh", refresh_img)
-            click_asset("target", target_img)
+            click_asset("target", target_img, confidence=0.86)
             click_asset("connect", connect_img)
 
         while image := is_onscreen(loading_img):
