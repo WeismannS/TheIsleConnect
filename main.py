@@ -72,7 +72,7 @@ def main():
 
         while image := is_onscreen(loading_img):
             time.sleep(0.2)
-        if image := (is_onscreen(close_img) or is_onscreen(close2_img)):
+        if image := (is_onscreen(close_img, confidence=0.5) or is_onscreen(close2_img,confidence=0.7)):
             pyautogui.click(image)
             pyautogui.moveTo(10, 10)
 
