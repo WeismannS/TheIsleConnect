@@ -1,54 +1,66 @@
 # The Isle Auto-Connect
 
-Automatically retry and reconnect to your favorite The Isle server when it opens up. No more sitting there hitting refresh.
+Automatically retry and reconnect to your favorite The Isle server. No more manual refreshing.
 
-The Isle removed the server queue system. Now you have to manually retry until you get in. This bot does that for you automatically.
+> The Isle removed its queue system. This bot monitors your screen and handles the retry loop for you.
+
+## Requirements
+
+- Windows or Linux
+- Python 3.x ([Microsoft Store](https://apps.microsoft.com/store/search/python) on Windows)
+- The Isle running in **fullscreen**
 
 ## Setup
 
-### 1. Install Python
-Download Python from the Microsoft Store (search "Python 3.14") and install it.
+**1. Create and activate a virtual environment**
 
-### 2. Create a virtual environment
-Open Command Prompt in this folder and run:
 ```cmd
 python -m venv .venv
 ```
 
-### 3. Activate the virtual environment
+Windows:
 ```cmd
-.venv\Scripts\activate
+.venv\Scripts\activate.bat
 ```
 
-### 4. Install dependencies
+Linux/macOS:
+```bash
+source .venv/bin/activate
+```
+
+**2. Install dependencies**
+
 ```cmd
 pip install -r requirements.txt
 ```
 
-### 5. Configure
-Set game to fullscreen
+**3. Configure your target server**
 
-To change the target server:
-1. Favorite only your target server
-2. Take a screenshot of your server's name in-game
-3. Save it as `assets/targets/bosch.png` (or any name)
-4. Open `main.py` and change `TARGET = "bosch.png"` to match your filename
+1. In-game, **favorite only** the server you want to join
+2. Take a screenshot of the server name as it appears in-game
+3. Save it to `assets/targets/` — e.g. `assets/targets/myserver.png`
+4. Open `main.py` and set:
+```python
+   TARGET = "myserver.png"
+```
 
-### 6. Run
+**4. Run**
+
 ```cmd
 python main.py
 ```
 
 ## How it works
 
-The bot monitors your screen for UI elements and automatically:
-- Navigates to the Unofficial servers tab
-- Refreshes until your target server appears
-- Connects to the server
-- Dismisses connection errors and reconnects
+Once running, the bot will:
+
+1. Navigate to the **Favorite servers** tab
+2. Refresh until your target server appears
+3. Attempt to connect
+4. Dismiss any connection errors and retry automatically
 
 ## Tips
 
-For reliable targeting:
-1. Favorite only your target server
-2. Keep the game window in a consistent position
+- Only favorite your target server — other favorites can confuse the matcher
+- Keep the game window in a consistent position between runs
+- The template screenshot must match what's on screen at your current resolution/DPI — retake it if you change display settings
