@@ -45,7 +45,9 @@ from ctypes import wintypes
 GAME_EXE = "theisleclient-win64-shipping.exe"
 STEAM_LAUNCH = "steam://rungameid/376210"
 LOG_PATH = os.path.expandvars(r"%LOCALAPPDATA%\TheIsle\Saved\Logs\TheIsle.log")
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "isle_reconnect.json")
+# Next to the .exe when built with PyInstaller (__file__ is then a temp unpack folder).
+APP_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(APP_DIR, "isle_reconnect.json")
 
 DEFAULT_CONFIG = {
     "server": "",

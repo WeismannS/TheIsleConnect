@@ -16,7 +16,17 @@ Fully automated join / rejoin bot for The Isle (Evrima). Start it once and leave
 - Python 3.9+
 - The Isle running **windowed or borderless** (exclusive fullscreen captures as black)
 
-## Setup
+## Quick start (no Python needed)
+
+1. Download `isle_reconnect.exe` from the [latest release](https://github.com/WeismannS/TheIsleConnect/releases/latest) into its own folder
+2. Open a terminal in that folder and run:
+```cmd
+isle_reconnect.exe run --server "part of the server name"
+```
+
+All the commands below work the same way with `isle_reconnect.exe` in place of `python isle_reconnect.py`. The config file is created next to the exe.
+
+## Setup (from source)
 
 **1. Create and activate a virtual environment**
 
