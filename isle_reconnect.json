@@ -52,6 +52,10 @@
       "COMMUNITY"
     ]
   },
+  "hotkeys": {
+    "quit": "F10",
+    "pause": "F11"
+  },
   "join_timeout": 90,
   "launch_timeout": 240,
   "rejoin_after_leave": false,

@@ -43,12 +43,14 @@ The server name is saved to `isle_reconnect.json`, so after the first run `pytho
 
 ## Hotkeys
 
-These work while the game has focus:
+Global hotkeys (they work while the game has focus):
 
 | Key | Action |
 |-----|--------|
 | F10 | Quit |
 | F11 | Pause / resume |
+
+Change them under `hotkeys` in `isle_reconnect.json` (any of F1-F24, PAUSE, SCROLLLOCK, INSERT, HOME, END). If another program already owns a key, the bot watches the key directly instead.
 
 ## Commands
 
@@ -58,6 +60,7 @@ These work while the game has focus:
 | `run --exit-on-join` | Stop once you're in |
 | `run --rejoin-after-leave` | Rejoin even when you leave or safe-log yourself (saved) |
 | `run --debug` | Print what OCR reads on each pass |
+| `stop` | Stop a running bot without the hotkey |
 | `scan` | OCR the game window once and print the text it finds |
 | `status` | Show what the log says the game is doing |
 
@@ -74,6 +77,7 @@ These work while the game has focus:
 | `search_box` | Position of the "Server Name Filter" box as a fraction of the window (relearned automatically) |
 | `ocr_scale` | How much to enlarge screenshots before OCR (the list font is small) |
 | `labels` | Button texts to look for, in priority order. Edit these if the game renames a button |
+| `hotkeys` | Keys for `quit` and `pause` |
 | `join_timeout` | Seconds without a result before navigating again |
 | `launch_timeout` | Seconds to wait for a relaunched game |
 | `rejoin_after_leave` | Rejoin even when you leave the server yourself |

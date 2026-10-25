@@ -14,9 +14,11 @@ What it does on its own:
   * Retries the moment a join fails, rejoins after a disconnect, and relaunches
     the game through Steam if it crashes.
 
-Hotkeys (work while the game has focus):  F10 quit   F11 pause / resume
+Hotkeys (global, work while the game has focus):  F10 quit   F11 pause / resume
+(change them under "hotkeys" in isle_reconnect.json)
 
 Other commands:
+    python isle_reconnect.py stop       stop a running bot without the hotkey
     python isle_reconnect.py scan       OCR the game window once and print what it sees
     python isle_reconnect.py status     show what the log says the game is doing
 
@@ -36,6 +38,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from ctypes import wintypes
 
@@ -63,13 +66,14 @@ DEFAULT_CONFIG = {
         "to_browser": ["PLAY", "SERVER BROWSER", "SERVERS", "BROWSE SERVERS", "MULTIPLAYER",
                        "FIND SERVER", "COMMUNITY"],
     },
+    "hotkeys": {"quit": "F10", "pause": "F11"},  # any of F1-F24, PAUSE, SCROLLLOCK, INSERT, HOME, END
     "join_timeout": 90,       # seconds without a result before navigating again
     "launch_timeout": 240,    # seconds to wait for a relaunched game
     "rejoin_after_leave": False,
     "relaunch_after_quit": False,
 }
 
-VK_F10, VK_F11, VK_RETURN = 0x79, 0x7A, 0x0D
+VK_RETURN = 0x0D
 
 
 def log(msg):
@@ -278,15 +282,67 @@ def is_black(data):
     return max(sample, default=0) < 8
 
 
-class Hotkeys:
-    def __init__(self, *vks):
-        self.down = {vk: False for vk in vks}
+KEY_NAMES = {**{f"F{i}": 0x6F + i for i in range(1, 25)},
+             "PAUSE": 0x13, "SCROLLLOCK": 0x91, "INSERT": 0x2D, "HOME": 0x24, "END": 0x23}
 
-    def pressed(self, vk):
-        now = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-        hit = now and not self.down[vk]
-        self.down[vk] = now
-        return hit
+
+class Hotkeys:
+    """Global hotkeys on their own thread, so a press is never missed while the bot is busy
+    reading the screen. Uses RegisterHotKey (delivered even over a focused full-screen game);
+    if another program already owns the key, falls back to watching the key directly."""
+
+    def __init__(self, keys):  # {"quit": "F10", "pause": "F11"}
+        self.keys = keys
+        self.hits = []
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+        self.ready.wait(2)
+
+    def _loop(self):
+        owned, polled, down = {}, [], {}
+        for i, (action, key) in enumerate(self.keys.items(), 1):
+            vk = KEY_NAMES.get(key.upper())
+            if vk is None:
+                log(f"Unknown hotkey '{key}' for {action} - use one of: {', '.join(KEY_NAMES)}")
+            elif user32.RegisterHotKey(None, i, 0x4000, vk):  # MOD_NOREPEAT
+                owned[i] = action
+            else:
+                log(f"{key} is already taken by another program (an overlay?) - "
+                    f"watching the key directly instead. Change it in isle_reconnect.json if it misbehaves.")
+                polled.append((action, vk))
+        self.ready.set()
+        msg = wintypes.MSG()
+        while True:
+            while user32.PeekMessageW(ctypes.byref(msg), None, 0x0312, 0x0312, 1):  # WM_HOTKEY, PM_REMOVE
+                self._hit(owned.get(msg.wParam))
+            for action, vk in polled:
+                state = user32.GetAsyncKeyState(vk)
+                now = bool(state & 0x8000)
+                if (now and not down.get(vk)) or (state & 1 and not now):  # held, or tapped between polls
+                    self._hit(action)
+                down[vk] = now
+            time.sleep(0.01)
+
+    def _hit(self, action):
+        if action:
+            with self.lock:
+                self.hits.append(action)
+
+    def take(self, action):
+        with self.lock:
+            if action in self.hits:
+                self.hits.remove(action)
+                return True
+        return False
+
+
+STOP_EVENT = "Local\\isle_reconnect_stop"  # 'python isle_reconnect.py stop' signals this
+kernel32.CreateEventW.restype = wintypes.HANDLE
+kernel32.OpenEventW.restype = wintypes.HANDLE
+kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+kernel32.ResetEvent.argtypes = [wintypes.HANDLE]
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 
 
 # --- OCR ---------------------------------------------------------------------
@@ -754,29 +810,45 @@ def cmd_scan(args):
         print(f"  ({line.center[0]:5.0f},{line.center[1]:5.0f})  {line.text}")
 
 
+def cmd_stop(args):
+    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    h = kernel32.OpenEventW(0x0002, False, STOP_EVENT)  # EVENT_MODIFY_STATE
+    if not h:
+        sys.exit("No bot is running.")
+    kernel32.SetEvent(h)
+    print("Stop signal sent - the bot exits within a second.")
+
+
 def cmd_run(args):
     # One bot at a time: two copies fight over the mouse.
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     _mutex = kernel32.CreateMutexW(None, False, "Local\\isle_reconnect_bot")
     if ctypes.get_last_error() == 183 or kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        sys.exit("Another copy of the bot is already running - stop it first (F10 in game).")
+        sys.exit("Another copy of the bot is already running - stop it with:  python isle_reconnect.py stop")
+    stop_event = kernel32.CreateEventW(None, True, False, STOP_EVENT)
+    kernel32.ResetEvent(stop_event)
     cfg = load_config(args)
     if not cfg["server"]:
         sys.exit('Tell it which server once:  python isle_reconnect.py run --server "part of the name"')
     game, ocr, gl = Game(), Ocr(), GameLog(args.log)
     nav = Navigator(cfg, game, ocr, debug=args.debug)
-    keys = Hotkeys(VK_F10, VK_F11)
+    hk = cfg["hotkeys"]
+    keys = Hotkeys(hk)
     paused = False
     attempts, join_started, launched_at, last_seen_game = 0, None, 0.0, time.time()
-    log(f"Bot running for '{cfg['server']}'. F10 quit, F11 pause.")
+    log(f"Bot running for '{cfg['server']}'. {hk['quit']} quit, {hk['pause']} pause "
+        f"(or: python isle_reconnect.py stop).")
     if gl.state == "ingame":
         log("Already in game - standing by, will rejoin if you get disconnected.")
 
     while True:
-        if keys.pressed(VK_F10):
-            log("Stopped.")
+        if keys.take("quit"):
+            log(f"Stopped ({hk['quit']} pressed).")
             return
-        if keys.pressed(VK_F11):
+        if kernel32.WaitForSingleObject(stop_event, 0) == 0:
+            log("Stopped (stop command).")
+            return
+        if keys.take("pause"):
             paused = not paused
             log("Paused." if paused else "Resumed.")
             nav.reset()
@@ -850,8 +922,9 @@ def main():
     r.add_argument("--debug", action="store_true", help="print what OCR reads each pass")
     sub.add_parser("scan", help="OCR the game window once and print the text found")
     sub.add_parser("status", help="show the game state from the log")
+    sub.add_parser("stop", help="stop a running bot (no hotkey needed)")
     args = p.parse_args()
-    {"run": cmd_run, "scan": cmd_scan, "status": cmd_status}[args.cmd](args)
+    {"run": cmd_run, "scan": cmd_scan, "status": cmd_status, "stop": cmd_stop}[args.cmd](args)
 
 
 if __name__ == "__main__":
