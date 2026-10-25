@@ -1,12 +1,15 @@
 [project]
-name = "auto-reconnect"
-version = "0.1.0"
-description = "Add your description here"
+name = "isle-reconnect"
+version = "0.2.0"
+description = "Fully automated join / rejoin bot for The Isle (Evrima)"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.9"
 dependencies = [
-    "opencv-python>=4.13.0.92",
-    "pillow>=12.2.0",
-    "pyautogui>=0.9.54",
-    "pyscreeze>=1.0.1",
+    "winrt-runtime; sys_platform == 'win32'",
+    "winrt-Windows.Media.Ocr; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams; sys_platform == 'win32'",
+    "winrt-Windows.Foundation; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections; sys_platform == 'win32'",
+    "winrt-Windows.Globalization; sys_platform == 'win32'",
 ]

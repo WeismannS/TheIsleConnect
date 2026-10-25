@@ -1,0 +1,59 @@
+{
+  "server": "",
+  "session_filter": "Unofficial",
+  "search_box": [
+    0.797,
+    0.178
+  ],
+  "ocr_scale": 2.0,
+  "labels": {
+    "any_key": [
+      "PRESS ANY KEY",
+      "CLICK TO CONTINUE",
+      "CLICK ANYWHERE"
+    ],
+    "dismiss": [
+      "OK",
+      "OKAY",
+      "CLOSE",
+      "DISMISS",
+      "CONTINUE"
+    ],
+    "join": [
+      "CONNECT",
+      "JOIN",
+      "JOIN SERVER"
+    ],
+    "confirm": [
+      "YES",
+      "CONFIRM",
+      "JOIN ANYWAY"
+    ],
+    "search": [
+      "SERVER NAME FILTER",
+      "SEARCH",
+      "SEARCH SERVERS"
+    ],
+    "refresh": [
+      "REFRESH"
+    ],
+    "browser": [
+      "SESSION FILTER",
+      "REFRESH",
+      "SERVER NAME FILTER"
+    ],
+    "to_browser": [
+      "PLAY",
+      "SERVER BROWSER",
+      "SERVERS",
+      "BROWSE SERVERS",
+      "MULTIPLAYER",
+      "FIND SERVER",
+      "COMMUNITY"
+    ]
+  },
+  "join_timeout": 90,
+  "launch_timeout": 240,
+  "rejoin_after_leave": false,
+  "relaunch_after_quit": false
+}
