@@ -58,7 +58,7 @@ The server name is saved to `isle_reconnect.json`, so after the first run `pytho
 
 A dark monitor built with [customtkinter](https://github.com/TomSchimansky/CustomTkinter): what the bot is doing and since when, attempt / join counters, a strip of every join attempt in the last 30 minutes (hover a tick for its time and result), and the activity log. Type part of the server's name, pick the session filter, and press **Start**. **Pause** / **Stop** do the same as the hotkeys, **Scan screen** prints what OCR sees (handy when the bot can't find something), and **Config file** (top right) opens `isle_reconnect.json` in Notepad. The settings are saved when you press Start.
 
-To build the exe yourself: `pip install pyinstaller` then `pyinstaller --onefile --collect-data customtkinter isle_reconnect.py`. Double-clicking it opens the window without a console; run from a terminal, it takes the commands below.
+To build the exe yourself: `pip install pyinstaller` then `pyinstaller --onefile --collect-data customtkinter --exclude-module PIL --exclude-module numpy isle_reconnect.py` (the two excludes keep out optional libraries the app never uses, about 17 MB). Double-clicking it opens the window without a console; run from a terminal, it takes the commands below.
 
 ## Hotkeys
 
