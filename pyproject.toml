@@ -1,6 +1,6 @@
 [project]
 name = "isle-reconnect"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fully automated join / rejoin bot for The Isle (Evrima)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,4 +12,5 @@ dependencies = [
     "winrt-Windows.Foundation; sys_platform == 'win32'",
     "winrt-Windows.Foundation.Collections; sys_platform == 'win32'",
     "winrt-Windows.Globalization; sys_platform == 'win32'",
+    "customtkinter",
 ]

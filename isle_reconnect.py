@@ -3,7 +3,8 @@ isle_reconnect.py - fully automated join / rejoin bot for The Isle (Evrima).
 
 Start it once and leave it running:
 
-    python isle_reconnect.py run --server "part of the server name"
+    python isle_reconnect.py                 opens a window (so does double-clicking the exe)
+    python isle_reconnect.py run --server "part of the server name"     same bot, console only
 
 What it does on its own:
   * Knows what the game is doing from its own log file (instant, never misreads):
@@ -32,11 +33,13 @@ Menu labels live in isle_reconnect.json (created on first run) if the game renam
 
 import argparse
 import asyncio
+import collections
 import ctypes
 import difflib
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -78,8 +81,15 @@ DEFAULT_CONFIG = {
 VK_RETURN = 0x0D
 
 
+log_sink = None  # the GUI points this at its log view; otherwise lines go to the console
+
+
 def log(msg):
-    print(time.strftime("[%H:%M:%S] ") + msg, flush=True)
+    line = time.strftime("[%H:%M:%S] ") + msg
+    if log_sink:
+        log_sink(line)
+    else:
+        print(line, flush=True)
 
 
 # --- Win32 -------------------------------------------------------------------
@@ -161,7 +171,11 @@ def _mouse(flags):
 def process_name(hwnd):
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    h = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    return pid_name(pid.value)
+
+
+def pid_name(pid):
+    h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
         return ""
     try:
@@ -298,8 +312,14 @@ class Hotkeys:
         self.hits = []
         self.lock = threading.Lock()
         self.ready = threading.Event()
-        threading.Thread(target=self._loop, daemon=True).start()
+        self.closed = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
         self.ready.wait(2)
+
+    def close(self):
+        self.closed.set()
+        self.thread.join(1)
 
     def _loop(self):
         owned, polled, down = {}, [], {}
@@ -315,7 +335,7 @@ class Hotkeys:
                 polled.append((action, vk))
         self.ready.set()
         msg = wintypes.MSG()
-        while True:
+        while not self.closed.is_set():
             while user32.PeekMessageW(ctypes.byref(msg), None, 0x0312, 0x0312, 1):  # WM_HOTKEY, PM_REMOVE
                 self._hit(owned.get(msg.wParam))
             for action, vk in polled:
@@ -325,6 +345,8 @@ class Hotkeys:
                     self._hit(action)
                 down[vk] = now
             time.sleep(0.01)
+        for i in owned:  # hotkeys belong to the thread that registered them
+            user32.UnregisterHotKey(None, i)
 
     def _hit(self, action):
         if action:
@@ -667,7 +689,7 @@ class Navigator:
         width, height = self.game.client_size()
         lines = self.ocr.read(self.game.capture(self.cfg.get("ocr_scale", 1.0)))
         if self.debug:
-            print(" | ".join(l.text for l in lines)[:300])
+            log("OCR: " + " | ".join(l.text for l in lines)[:300])
         L = self.labels
         server = self.cfg["server"]
 
@@ -790,9 +812,13 @@ def load_config(args):
         cfg["server"] = args.server
     if getattr(args, "rejoin_after_leave", False):
         cfg["rejoin_after_leave"] = True
+    save_config(cfg)
+    return cfg
+
+
+def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
-    return cfg
 
 
 def cmd_status(args):
@@ -801,15 +827,19 @@ def cmd_status(args):
     print(f"Game running: {running}\nLog state:    {gl.state}\nLast server:  {gl.server_ip}")
 
 
-def cmd_scan(args):
+def scan():
+    """OCR the game window once; returns the report as lines of text."""
     game = Game()
     if not game.find():
         sys.exit("Game window not found.")
     image = game.capture(DEFAULT_CONFIG["ocr_scale"])
     lines = Ocr().read(image)
-    print(f"{game.client_size()}, {len(lines)} text lines:")
-    for line in lines:
-        print(f"  ({line.center[0]:5.0f},{line.center[1]:5.0f})  {line.text}")
+    return [f"{game.client_size()}, {len(lines)} text lines:"] + [
+        f"  ({line.center[0]:5.0f},{line.center[1]:5.0f})  {line.text}" for line in lines]
+
+
+def cmd_scan(args):
+    print("\n".join(scan()))
 
 
 def cmd_stop(args):
@@ -821,101 +851,736 @@ def cmd_stop(args):
     print("Stop signal sent - the bot exits within a second.")
 
 
+class Bot:
+    """The join / rejoin loop. run() blocks until the bot stops; stop() and toggle_pause()
+    can be called from any thread (the GUI's buttons). Quitting via the hotkey or the
+    'stop' command also ends run()."""
+
+    def __init__(self, cfg, log_path=LOG_PATH, debug=False, exit_on_join=False):
+        self.cfg, self.log_path, self.debug, self.exit_on_join = cfg, log_path, debug, exit_on_join
+        self.paused = False
+        self.attempts = 0
+        self.joins = 0
+        # Mirrors of the game's state from its log, for the GUI.
+        self.state, self.since, self.server_ip = "starting", time.time(), None
+        self.game_running = None  # unknown until the first check
+        self.started_at = self.ended_at = None
+        self.events = collections.deque(maxlen=5000)  # (time, kind) for the GUI's attempt strip
+        self._stop = threading.Event()
+        self._toggle = threading.Event()
+        self._wake = threading.Event()  # cuts a sleep short so the buttons respond at once
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def toggle_pause(self):
+        self._toggle.set()
+        self._wake.set()
+
+    def _sleep(self, seconds):
+        self._wake.wait(seconds)
+        self._wake.clear()
+
+    def run(self):
+        # One bot at a time: two copies fight over the mouse.
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        mutex = kernel32.CreateMutexW(None, False, "Local\\isle_reconnect_bot")
+        if ctypes.get_last_error() == 183 or kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(mutex)
+            sys.exit("Another copy of the bot is already running - stop it with:  python isle_reconnect.py stop")
+        stop_event = kernel32.CreateEventW(None, True, False, STOP_EVENT)
+        kernel32.ResetEvent(stop_event)
+        keys = None
+        try:
+            if not self.cfg["server"]:
+                sys.exit('Tell it which server once:  python isle_reconnect.py run --server "part of the name"')
+            keys = Hotkeys(self.cfg["hotkeys"])
+            self._loop(keys, stop_event)
+        finally:
+            if keys:
+                keys.close()
+            kernel32.CloseHandle(stop_event)
+            kernel32.CloseHandle(mutex)  # lets the GUI start the bot again
+            self.ended_at = time.time()
+
+    def _loop(self, keys, stop_event):
+        cfg = self.cfg
+        game, ocr, gl = Game(), Ocr(), GameLog(self.log_path)
+        nav = Navigator(cfg, game, ocr, debug=self.debug)
+        hk = cfg["hotkeys"]
+        self.started_at = time.time()
+        join_started, launched_at, last_seen_game = None, 0.0, time.time()
+        log(f"Bot running for '{cfg['server']}'. {hk['quit']} quit, {hk['pause']} pause "
+            f"(or: python isle_reconnect.py stop).")
+        if gl.state == "ingame":
+            self.events.append((time.time(), "ingame"))
+            log("Already in game - standing by, will rejoin if you get disconnected.")
+
+        while True:
+            self.state, self.since, self.server_ip = gl.state, gl.since, gl.server_ip
+            if keys.take("quit"):
+                log(f"Stopped ({hk['quit']} pressed).")
+                return
+            if self._stop.is_set():
+                log("Stopped.")
+                return
+            if kernel32.WaitForSingleObject(stop_event, 0) == 0:
+                log("Stopped (stop command).")
+                return
+            if keys.take("pause") or self._toggle.is_set():
+                self._toggle.clear()
+                self.paused = not self.paused
+                log("Paused." if self.paused else "Resumed.")
+                nav.reset()
+
+            for ev in gl.poll():
+                self.events.append((time.time(), ev))
+                if ev == "joining":
+                    self.attempts += 1
+                    join_started = time.time()
+                    log(f"Attempt #{self.attempts}: connecting to {gl.server_ip}...")
+                elif ev == "join_failed":
+                    took = time.time() - join_started if join_started else 0
+                    log(f"Attempt #{self.attempts} rejected after {took:.1f}s (server full?) - retrying")
+                elif ev == "ingame":
+                    log(f"IN GAME after {self.attempts} attempt(s).")
+                    self.joins += 1
+                    if self.exit_on_join:
+                        return
+                    self.attempts = 0
+                elif ev == "disconnected":
+                    log("Disconnected from the server - rejoining")
+                elif ev == "left":
+                    if cfg["rejoin_after_leave"]:
+                        log("Left the server - rejoining")
+                    else:
+                        self.paused = True
+                        log(f"You left the server yourself - paused ({hk['pause']} to rejoin).")
+                elif ev == "closed":
+                    if not cfg["relaunch_after_quit"]:
+                        self.paused = True
+                        log(f"Game was closed normally - paused ({hk['pause']} to relaunch and rejoin).")
+                elif ev == "menu":
+                    nav.reset()
+
+            if self.paused:
+                self._sleep(0.1)
+                continue
+
+            now = time.time()
+            self.game_running = bool(game.find())
+            if not self.game_running:
+                if now - last_seen_game > 5 and now - launched_at > cfg["launch_timeout"]:
+                    log("Game is not running - launching it through Steam")
+                    os.startfile(STEAM_LAUNCH)
+                    launched_at = now
+                    nav.reset()
+                self._sleep(1)
+                continue
+            last_seen_game = now
+
+            if gl.state == "joining" and now - gl.since > cfg["join_timeout"]:
+                log("No join result for a while - checking the screen")
+                gl.state = "menu"
+            if gl.state == "menu" or (gl.state == "starting" and now - gl.since > 20):
+                try:
+                    nav.tick()
+                except OSError as e:
+                    log(f"Capture/OCR hiccup: {e}")
+                self._sleep(0.05)
+            else:
+                self._sleep(0.1)
+
+
 def cmd_run(args):
-    # One bot at a time: two copies fight over the mouse.
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    _mutex = kernel32.CreateMutexW(None, False, "Local\\isle_reconnect_bot")
-    if ctypes.get_last_error() == 183 or kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        sys.exit("Another copy of the bot is already running - stop it with:  python isle_reconnect.py stop")
-    stop_event = kernel32.CreateEventW(None, True, False, STOP_EVENT)
-    kernel32.ResetEvent(stop_event)
-    cfg = load_config(args)
-    if not cfg["server"]:
-        sys.exit('Tell it which server once:  python isle_reconnect.py run --server "part of the name"')
-    game, ocr, gl = Game(), Ocr(), GameLog(args.log)
-    nav = Navigator(cfg, game, ocr, debug=args.debug)
-    hk = cfg["hotkeys"]
-    keys = Hotkeys(hk)
-    paused = False
-    attempts, join_started, launched_at, last_seen_game = 0, None, 0.0, time.time()
-    log(f"Bot running for '{cfg['server']}'. {hk['quit']} quit, {hk['pause']} pause "
-        f"(or: python isle_reconnect.py stop).")
-    if gl.state == "ingame":
-        log("Already in game - standing by, will rejoin if you get disconnected.")
+    Bot(load_config(args), args.log, debug=args.debug, exit_on_join=args.exit_on_join).run()
 
-    while True:
-        if keys.take("quit"):
-            log(f"Stopped ({hk['quit']} pressed).")
+
+# --- GUI ---------------------------------------------------------------------
+
+
+def hide_own_console():
+    """When the exe is double-clicked Windows opens a console just for it; close that one.
+    A terminal you started it from has other processes in it and is left alone."""
+    own = {os.getpid()}
+    if getattr(sys, "frozen", False) and pid_name(os.getppid()) == pid_name(os.getpid()):
+        own.add(os.getppid())  # a one-file exe runs as two processes: the unpacker and Python
+    procs = (wintypes.DWORD * 8)()
+    n = kernel32.GetConsoleProcessList(procs, len(procs))
+    if 0 < n <= len(procs) and set(procs[:n]) <= own:
+        kernel32.FreeConsole()
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+
+
+# The data-terminal style (.taste-skill/direction.json): true-neutral darks with cards a step darker
+# than the ground, figures in a monospace, colour only on data and status, and every selection marked
+# by one 1px accent line.
+GROUND, SURFACE, RAISED = "#171719", "#131217", "#212023"
+BORDER, CONTROL, GRID = "#222224", "#3a3a3e", "#232327"
+TEXT, MUTED = "#ffffff", "#8a8c92"
+ACCENT, POSITIVE, NEGATIVE, WARNING = "#4a8ad6", "#44a282", "#e5566f", "#d9a441"
+SESSIONS = ["Official", "Unofficial", "Favourites", "History"]
+STRIP_SPAN = 30 * 60  # seconds of history in the attempt strip
+
+LOG_COLOURS = [  # first match wins; routine retries stay grey so a real problem stands out
+    (MUTED, ("OCR:", "rejected after")),
+    (POSITIVE, ("IN GAME", "Already in game")),
+    (NEGATIVE, ("Disconnected", "Error", "not found", "already running", "hiccup", "No Windows OCR",
+                "Unknown hotkey")),
+    (WARNING, ("Paused", "paused", "Stopped", "launching", "already taken")),
+]
+
+
+def mix(a, b, t):
+    """Blend two #rrggbb colours; t=0 gives a, t=1 gives b."""
+    a, b = int(a[1:], 16), int(b[1:], 16)
+    return "#" + "".join(f"{round(((a >> s) & 255) * (1 - t) + ((b >> s) & 255) * t):02x}" for s in (16, 8, 0))
+
+
+def app_icon(size=64):
+    """The window / taskbar icon, drawn here so there's no image file to ship:
+    an accent ring around a dot on a dark rounded square."""
+    import tkinter
+    img = tkinter.PhotoImage(width=size, height=size)
+    c, rows, clear = (size - 1) / 2, [], []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            dx, dy = abs(x - c), abs(y - c)
+            d = (dx * dx + dy * dy) ** 0.5
+            ring = (size * 0.055 - abs(d - size * 0.3)) + 0.5  # each shape fades out over one pixel
+            dot = (size * 0.13 - d) + 0.5
+            row.append(mix(GROUND, ACCENT, min(max(ring, dot, 0.0), 1.0)))
+            if max(dx - size * 0.3, 0) ** 2 + max(dy - size * 0.3, 0) ** 2 > (size * 0.2) ** 2:
+                clear.append((x, y))  # outside the rounded corners
+        rows.append("{" + " ".join(row) + "}")
+    img.put(" ".join(rows))
+    for x, y in clear:
+        img.transparency_set(x, y, True)
+    return img
+
+
+def clock(seconds):
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def hhmm(t, seconds=False):
+    return time.strftime("%H:%M:%S" if seconds else "%H:%M", time.localtime(t))
+
+
+def join_attempts(events):
+    """Each join attempt with how it ended: [start, end or None, "rejected" / "joined" / None]."""
+    out = []
+    for t, ev in events:
+        if ev == "joining":
+            out.append([t, None, None])
+        elif out and out[-1][1] is None and ev in ("join_failed", "ingame"):
+            out[-1][1:] = [t, "joined" if ev == "ingame" else "rejected"]
+    return out
+
+
+def game_spans(events, end):
+    """(start, end) of each stretch spent in game."""
+    spans, start = [], None
+    for t, ev in events:
+        if ev == "ingame" and start is None:
+            start = t
+        elif ev in ("disconnected", "left", "closed", "joining", "menu") and start is not None:
+            spans.append((start, t))
+            start = None
+    if start is not None:
+        spans.append((start, end))
+    return spans
+
+
+class App:
+    """A window around Bot: what it's doing, its recent join attempts, the log and the settings."""
+
+    def __init__(self, log_path):
+        import queue
+        import tkinter as tk
+        import tkinter.font as tkfont
+        try:
+            import customtkinter as ctk
+            from customtkinter.windows.widgets.scaling import ScalingTracker
+        except ImportError:
+            sys.exit("The window needs customtkinter:  pip install customtkinter")
+
+        self.log_path = log_path
+        self.bot, self.thread, self.was_running = None, None, None
+        self.hover_x, self.ticks = None, 0
+        self.lines = queue.Queue()
+        global log_sink
+        log_sink = self.lines.put  # log() is called from the bot's thread; Tk is drained on ours
+
+        cfg = load_config(None)
+        self.hotkeys = cfg["hotkeys"]
+        ctk.set_appearance_mode("dark")
+        self.root = root = ctk.CTk(fg_color=GROUND)
+        root.title("Isle Auto-Connect")
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.icon = app_icon()
+        root.iconphoto(True, self.icon)
+        root._iconbitmap_method_called = True  # stops customtkinter swapping in its own icon
+        k = self.scale = ScalingTracker.get_widget_scaling(root)
+
+        def px(v):  # plain Tk widgets aren't scaled by customtkinter; these are
+            return max(1, round(v * k))
+
+        families = set(tkfont.families(root))
+        mono = next((f for f in ("Cascadia Mono", "Consolas") if f in families), "Courier New")
+        # The log in a lighter cut of the same face, so the figures stay the loudest type on screen.
+        log_face = mono + " SemiLight" if mono + " SemiLight" in families else mono
+        semi = "Segoe UI Semibold" if "Segoe UI Semibold" in families else "Segoe UI"
+
+        def font(size, family="Segoe UI"):
+            return ctk.CTkFont(family=family, size=size)
+
+        self.tick_font = tkfont.Font(family=mono, size=-px(11))
+        self.note_font = tkfont.Font(family="Segoe UI", size=-px(12))
+
+        def card(parent, **grid):
+            frame = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=6, border_width=1, border_color=BORDER)
+            frame.grid(**grid)
+            return frame
+
+        def card_header(parent, title, note=None):
+            head = ctk.CTkFrame(parent, fg_color="transparent")
+            head.grid(row=0, column=0, columnspan=9, sticky="ew", padx=20, pady=(14, 6))
+            ctk.CTkLabel(head, text=title, font=font(16, semi), text_color=TEXT, height=24).pack(side="left")
+            if note:
+                ctk.CTkLabel(head, text=note, font=font(13), text_color=MUTED, height=24).pack(side="left", padx=(8, 0))
+            return head
+
+        def text_button(parent, text, command):
+            return ctk.CTkButton(parent, text=text, command=command, width=0, height=28, corner_radius=14,
+                                 font=font(13), fg_color="transparent", hover_color=RAISED, text_color=MUTED)
+
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_rowconfigure(2, weight=1)
+
+        # Top bar: the product, and the global hotkeys that work while the game has focus.
+        bar = ctk.CTkFrame(root, fg_color=GROUND, height=48, corner_radius=0)
+        bar.grid(row=0, column=0, sticky="ew", padx=32)
+        mark = tk.Canvas(bar, width=px(20), height=px(20), bg=GROUND, highlightthickness=0)
+        mark.create_oval(px(2), px(2), px(18), px(18), outline=ACCENT, width=px(2))
+        mark.create_oval(px(7), px(7), px(13), px(13), fill=ACCENT, width=0)
+        mark.pack(side="left", pady=px(13))
+        ctk.CTkLabel(bar, text="Isle Auto-Connect", font=font(14, semi), text_color=TEXT).pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(bar, text="for The Isle: Evrima", font=font(13), text_color=MUTED).pack(side="left", padx=(8, 0))
+        text_button(bar, "Config file", self.edit_config).pack(side="right", padx=(16, 0))
+        for key, what in ((self.hotkeys["pause"], "Pause"), (self.hotkeys["quit"], "Stop")):  # packed right to left
+            ctk.CTkLabel(bar, text=what, font=font(12), text_color=MUTED).pack(side="right", padx=(6, 14))
+            ctk.CTkLabel(bar, text=key, font=font(12, mono), text_color=TEXT, fg_color=RAISED,
+                         corner_radius=4, width=34, height=22).pack(side="right")
+        tk.Frame(root, height=1, bg=BORDER).grid(row=1, column=0, sticky="ew")
+
+        page = ctk.CTkFrame(root, fg_color="transparent")
+        page.grid(row=2, column=0, sticky="nsew", padx=32, pady=(24, 28))
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(4, weight=1)
+
+        # Title row: the server is the object this screen is about; the finding sits under it.
+        title = ctk.CTkFrame(page, fg_color="transparent")
+        title.grid(row=0, column=0, columnspan=2, sticky="ew")
+        title.grid_columnconfigure(0, weight=1)
+        self.h1 = ctk.CTkLabel(title, text="", font=font(26, semi), text_color=TEXT, height=34, anchor="w")
+        self.h1.grid(row=0, column=0, sticky="w")
+        self.finding = ctk.CTkLabel(title, text="", font=font(14), text_color=MUTED, height=20, anchor="w")
+        self.finding.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        actions = ctk.CTkFrame(title, fg_color="transparent")
+        actions.grid(row=0, column=1, rowspan=2, sticky="e")
+        self.pause_btn = ctk.CTkButton(actions, text="Pause", command=self.pause, width=92, height=34,
+                                       corner_radius=17, font=font(13, semi), fg_color="transparent",
+                                       hover_color=RAISED, border_width=1, border_color=CONTROL,
+                                       text_color=TEXT, text_color_disabled=MUTED)
+        self.pause_btn.pack(side="left")
+        self.start_btn = ctk.CTkButton(actions, text="Start", command=self.start_stop, width=92, height=34,
+                                       corner_radius=17, font=font(13, semi), border_width=1)
+        self.start_btn.pack(side="left", padx=(10, 0))
+
+        # KPIs: one card split by 1px rules. The status word is the answer, so it leads.
+        kpis = card(page, row=1, column=0, columnspan=2, sticky="ew", pady=(24, 0))
+        self.kpi = {}
+        for i, (key, label) in enumerate([("status", "Status"), ("attempts", "Attempts this streak"),
+                                          ("joins", "Times joined"), ("uptime", "Watching for")]):
+            if i:
+                tk.Frame(kpis, width=1, bg=BORDER).grid(row=0, column=2 * i - 1, sticky="ns", pady=px(16))
+            kpis.grid_columnconfigure(2 * i, weight=1, uniform="kpi")
+            cell = ctk.CTkFrame(kpis, fg_color="transparent")
+            cell.grid(row=0, column=2 * i, sticky="nsew", padx=20, pady=(14, 14))
+            ctk.CTkLabel(cell, text=label, font=font(12), text_color=MUTED, height=16, anchor="w").pack(anchor="w")
+            line = ctk.CTkFrame(cell, fg_color="transparent")
+            line.pack(anchor="w", fill="x")
+            if key == "status":
+                self.dot = tk.Canvas(line, width=px(8), height=px(38), bg=SURFACE, highlightthickness=0)
+                self.dot.create_oval(0, px(17), px(8), px(25), fill=MUTED, width=0, tags="dot")
+                self.dot.pack(side="left", padx=(0, px(10)))
+                value = ctk.CTkLabel(line, text="", font=font(28, semi), text_color=TEXT, height=38, anchor="w")
+            else:
+                value = ctk.CTkLabel(line, text="", font=font(20, mono), text_color=TEXT, height=38, anchor="sw")
+            value.pack(side="left")
+            sub = ctk.CTkLabel(cell, text="", font=font(12, mono), text_color=MUTED, height=16, anchor="w")
+            sub.pack(anchor="w")
+            self.kpi[key] = (value, sub)
+
+        # The attempt strip: every join attempt of the last half hour as a tick, time in game as a bar.
+        strip_card = card(page, row=2, column=0, columnspan=2, sticky="ew", pady=(24, 0))
+        strip_card.grid_columnconfigure(0, weight=1)
+        head = card_header(strip_card, "Join attempts", "last 30 minutes")
+        self.legend = {}
+        for kind, label in (("dropped", "Dropped"), ("game", "In game"), ("attempt", "Attempt")):
+            item = ctk.CTkFrame(head, fg_color="transparent")
+            sw = tk.Canvas(item, width=px(12), height=px(12), bg=SURFACE, highlightthickness=0)
+            if kind == "game":
+                sw.create_rectangle(0, px(4), px(12), px(10), fill=POSITIVE, width=0)
+            else:
+                sw.create_line(px(6), 0, px(6), px(12), fill=ACCENT if kind == "attempt" else NEGATIVE, width=px(2))
+            sw.pack(side="left")
+            ctk.CTkLabel(item, text=label, font=font(12), text_color=MUTED, height=24).pack(side="left", padx=(6, 0))
+            self.legend[kind] = item
+        self.strip = tk.Canvas(strip_card, height=px(84), bg=SURFACE, highlightthickness=0)
+        self.strip.grid(row=1, column=0, sticky="ew", padx=px(20), pady=(px(4), px(16)))
+        self.strip.bind("<Configure>", lambda e: self._draw_strip())
+        self.strip.bind("<Motion>", self._hover)
+        self.strip.bind("<Leave>", self._hover)
+
+        # Activity (the log) beside the settings.
+        activity = card(page, row=4, column=0, sticky="nsew", pady=(24, 0), padx=(0, 24))
+        activity.grid_columnconfigure(0, weight=1)
+        activity.grid_rowconfigure(1, weight=1)
+        head = card_header(activity, "Activity")
+        text_button(head, "Clear", self.clear).pack(side="right")
+        text_button(head, "Scan screen", self.scan).pack(side="right", padx=(0, 4))
+        self.view = ctk.CTkTextbox(activity, fg_color=SURFACE, corner_radius=0, border_width=0, height=120,
+                                   font=font(12, log_face), text_color=TEXT, wrap="word", state="disabled",
+                                   scrollbar_button_color=RAISED, scrollbar_button_hover_color=CONTROL)
+        self.view.grid(row=1, column=0, sticky="nsew", padx=(12, 6), pady=(0, 10))
+        self.view.tag_config("time", foreground=MUTED)
+        indent = tkfont.Font(family=log_face, size=-px(12)).measure("00:00:00  ")  # wrapped lines hang under the text
+        for colour in (TEXT, MUTED, POSITIVE, NEGATIVE, WARNING):
+            self.view.tag_config(colour, foreground=colour, lmargin2=indent)
+
+        settings = card(page, row=4, column=1, sticky="n", pady=(24, 0))
+        settings.grid_columnconfigure(0, weight=1)
+        head = card_header(settings, "Settings")
+        self.locked = ctk.CTkLabel(head, text="", font=font(12), text_color=MUTED, height=24)
+        self.locked.pack(side="right")
+
+        def label(text, row, top=14):
+            ctk.CTkLabel(settings, text=text, font=font(13), text_color=MUTED, height=18, anchor="w").grid(
+                row=row, column=0, sticky="w", padx=20, pady=(top, 6))
+
+        label("Server name, or part of it", 1, top=4)
+        self.server = ctk.CTkEntry(settings, width=300, height=34, corner_radius=6, font=font(13),
+                                   fg_color=RAISED, border_width=1, border_color=CONTROL, text_color=TEXT,
+                                   placeholder_text="as shown in the server list", placeholder_text_color=MUTED)
+        self.server.grid(row=2, column=0, sticky="ew", padx=20)
+        if cfg["server"]:
+            self.server.insert(0, cfg["server"])
+        self.server.bind("<Return>", lambda e: self.start_stop() if not self.running() else None)
+
+        # Session filter as underline tabs: the selection is a 1px accent line under its label,
+        # on a full-width 1px rule.
+        label("Session filter", 3)
+        tabs = ctk.CTkFrame(settings, fg_color="transparent")
+        tabs.grid(row=4, column=0, sticky="ew", padx=20)
+        tk.Frame(tabs, height=1, bg=BORDER).grid(row=1, column=0, columnspan=2 * len(SESSIONS), sticky="ew")
+        tabs.grid_columnconfigure(2 * len(SESSIONS) - 1, weight=1)
+        self.session = cfg["session_filter"]
+        self.tabs = {}
+        for i, name in enumerate(SESSIONS):
+            if i:
+                tabs.grid_columnconfigure(2 * i - 1, minsize=px(18))
+            tab = ctk.CTkLabel(tabs, text=name, font=font(13), height=28, cursor="hand2")
+            tab.grid(row=0, column=2 * i, sticky="w")
+            tab.bind("<Button-1>", lambda e, n=name: self._pick_session(n))
+            line = tk.Frame(tabs, height=1, bg=BORDER)
+            line.grid(row=1, column=2 * i, sticky="ew")
+            self.tabs[name] = (tab, line)
+        self._pick_session(self.session)
+
+        self.rejoin = ctk.BooleanVar(value=cfg["rejoin_after_leave"])
+        self.relaunch = ctk.BooleanVar(value=cfg["relaunch_after_quit"])
+        self.exit_on_join = ctk.BooleanVar(value=False)
+        self.debug = ctk.BooleanVar(value=False)
+        self.switches = []
+        rows = [(self.rejoin, "Rejoin after I leave myself"), (self.relaunch, "Relaunch the game if it closes"),
+                (self.exit_on_join, "Stop once I'm in"), (self.debug, "Log what OCR reads")]
+        for i, (var, text) in enumerate(rows):
+            row = ctk.CTkFrame(settings, fg_color="transparent")
+            row.grid(row=5 + i, column=0, sticky="ew", padx=20, pady=(16 if i == 0 else 0, 16 if i == 3 else 0))
+            ctk.CTkLabel(row, text=text, font=font(13), text_color=TEXT, height=32).pack(side="left")
+            sw = ctk.CTkSwitch(row, text="", variable=var, width=34, switch_width=32, switch_height=16,
+                               progress_color=POSITIVE, fg_color=CONTROL, button_color=TEXT,
+                               button_hover_color="#e6e6e6")
+            sw.pack(side="right")
+            self.switches.append(sw)
+
+        self.server.bind("<KeyRelease>", lambda e: self._title())
+        log("Ready.")
+        self._title()
+        self._refresh()
+        root.update_idletasks()  # open at the height the content asks for; customtkinter sizes are unscaled
+        height = round(root.winfo_reqheight() / k)
+        root.geometry(f"1120x{height}")
+        root.minsize(980, height)
+
+    # --- actions
+
+    def running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start_stop(self):
+        if self.running():
+            self.bot.stop()
             return
-        if kernel32.WaitForSingleObject(stop_event, 0) == 0:
-            log("Stopped (stop command).")
+        server = self.server.get().strip()
+        if not server:
+            log("Type part of the server's name first, as shown in the in-game server list.")
+            self.server.focus_set()
             return
-        if keys.take("pause"):
-            paused = not paused
-            log("Paused." if paused else "Resumed.")
-            nav.reset()
+        cfg = load_config(None)
+        cfg.update(server=server, session_filter=self.session,
+                   rejoin_after_leave=self.rejoin.get(), relaunch_after_quit=self.relaunch.get())
+        save_config(cfg)
+        self.bot = Bot(cfg, self.log_path, debug=self.debug.get(), exit_on_join=self.exit_on_join.get())
+        self.thread = self._background(self.bot.run)
 
-        for ev in gl.poll():
-            if ev == "joining":
-                attempts += 1
-                join_started = time.time()
-                log(f"Attempt #{attempts}: connecting to {gl.server_ip}...")
-            elif ev == "join_failed":
-                took = time.time() - join_started if join_started else 0
-                log(f"Attempt #{attempts} rejected after {took:.1f}s (server full?) - retrying")
-            elif ev == "ingame":
-                log(f"IN GAME after {attempts} attempt(s).")
-                if args.exit_on_join:
-                    return
-                attempts = 0
-            elif ev == "disconnected":
-                log("Disconnected from the server - rejoining")
-            elif ev == "left":
-                if cfg["rejoin_after_leave"]:
-                    log("Left the server - rejoining")
-                else:
-                    paused = True
-                    log("You left the server yourself - paused (F11 to rejoin).")
-            elif ev == "closed":
-                if not cfg["relaunch_after_quit"]:
-                    paused = True
-                    log("Game was closed normally - paused (F11 to relaunch and rejoin).")
-            elif ev == "menu":
-                nav.reset()
+    def pause(self):
+        if self.running():
+            self.bot.toggle_pause()
 
-        if paused:
-            time.sleep(0.1)
-            continue
+    def scan(self):
+        self._background(lambda: [log(line) for line in scan()])
 
-        now = time.time()
-        if not game.find():
-            if now - last_seen_game > 5 and now - launched_at > cfg["launch_timeout"]:
-                log("Game is not running - launching it through Steam")
-                os.startfile(STEAM_LAUNCH)
-                launched_at = now
-                nav.reset()
-            time.sleep(1)
-            continue
-        last_seen_game = now
+    def edit_config(self):
+        subprocess.Popen(["notepad.exe", CONFIG_PATH])
 
-        if gl.state == "joining" and now - gl.since > cfg["join_timeout"]:
-            log("No join result for a while - checking the screen")
-            gl.state = "menu"
-        if gl.state == "menu" or (gl.state == "starting" and now - gl.since > 20):
+    def clear(self):
+        self.view.configure(state="normal")
+        self.view.delete("1.0", "end")
+        self.view.configure(state="disabled")
+
+    def close(self):
+        if self.running():
+            self.bot.stop()
+            self.thread.join(2)
+        self.root.destroy()
+
+    def _pick_session(self, name):
+        if self.running():
+            return
+        self.session = name
+        for n, (tab, line) in self.tabs.items():
+            tab.configure(text_color=TEXT if n == name else MUTED)
+            line.configure(bg=ACCENT if n == name else BORDER)
+
+    def _background(self, work):
+        def guarded():
             try:
-                nav.tick()
-            except OSError as e:
-                log(f"Capture/OCR hiccup: {e}")
-            time.sleep(0.05)
+                work()
+            except SystemExit as e:  # the CLI's error exits; here they're just messages
+                log(str(e.code))
+            except Exception as e:
+                log(f"Error: {e!r}")
+        thread = threading.Thread(target=guarded, daemon=True)
+        thread.start()
+        return thread
+
+    # --- drawing
+
+    def _title(self):
+        server = self.bot.cfg["server"] if self.running() else self.server.get().strip()
+        self.h1.configure(text=server or "No server chosen", text_color=TEXT if server else MUTED)
+
+    def _append(self, lines):
+        at_bottom = self.view.yview()[1] > 0.99
+        self.view.configure(state="normal")
+        for line in lines:
+            stamp, _, msg = line.partition("] ")
+            colour = next((c for c, words in LOG_COLOURS if any(w in msg for w in words)), TEXT)
+            self.view.insert("end", stamp.lstrip("[") + "  ", "time")
+            self.view.insert("end", msg + "\n", colour)
+        if int(self.view.index("end-1c").split(".")[0]) > 2000:
+            self.view.delete("1.0", "500.0")
+        self.view.configure(state="disabled")
+        if at_bottom:
+            self.view.see("end")
+
+    def _status(self, running):
+        """The status word, its dot colour, how long it has held, and the finding under the title."""
+        bot, now = self.bot, time.time()
+        if bot is None:
+            return "Idle", MUTED, "", "Not watching the game yet."
+        events = list(bot.events)
+        tries = sum(ev == "joining" for _, ev in events)
+        if not running:
+            ended = bot.ended_at or now
+            return ("Stopped", MUTED, f"at {hhmm(ended)}",
+                    f"Stopped at {hhmm(ended)} after {tries} attempt{'s' * (tries != 1)}"
+                    f" and {bot.joins} join{'s' * (bot.joins != 1)}.")
+        held = f"for {clock(now - bot.since)}"
+        if bot.paused:
+            return "Paused", WARNING, "", f"Paused. {self.hotkeys['pause']} or Resume carries on."
+        if bot.game_running is False and bot.state != "ingame":
+            return "No game", WARNING, "", "The Isle isn't running. Waiting for it to start."
+        last_in = max((t for t, ev in events if ev == "ingame"), default=0)
+        rejected = [t for t, ev in events if ev == "join_failed" and t > last_in]
+        streak = (f"{len(rejected)} attempt{'s' * (len(rejected) != 1)} rejected since {hhmm(rejected[0])}, "
+                  "probably full" if rejected else "")
+        ip = bot.server_ip or "the server"
+        if bot.state == "ingame":
+            return "In game", POSITIVE, held, f"In game on {ip} since {hhmm(bot.since)}."
+        if bot.state == "joining":
+            return "Joining", ACCENT, held, f"Attempt {bot.attempts} on {ip}" + (f". {streak}." if streak else ".")
+        if bot.state in ("menu", "loading"):
+            return ("In menus" if bot.state == "menu" else "Loading", ACCENT, held,
+                    streak + "." if streak else f"Looking for “{bot.cfg['server']}” in the server list.")
+        if bot.state == "closed":
+            return "Closed", MUTED, held, "The game was closed."
+        return "Waiting", ACCENT, held, "Waiting for the game to reach its menus."
+
+    def _refresh(self):
+        lines = []
+        while not self.lines.empty():
+            lines.append(self.lines.get())
+        if lines:
+            self._append(lines)
+
+        running, bot, now = self.running(), self.bot, time.time()
+        word, colour, held, finding = self._status(running)
+        self.dot.itemconfigure("dot", fill=colour)
+        value, sub = self.kpi["status"]
+        value.configure(text=word)
+        sub.configure(text=held)
+        self.finding.configure(text=finding)
+        if bot:
+            events = list(bot.events)
+            first = [t for t, ev in events if ev == "joining" and t > max(
+                (t2 for t2, e2 in events if e2 == "ingame"), default=0)]
+            last_in = [t for t, ev in events if ev == "ingame"]
+            stats = {"attempts": (str(bot.attempts), f"since {hhmm(first[0])}" if first else "none yet"),
+                     "joins": (str(bot.joins), f"last at {hhmm(last_in[-1])}" if last_in else "none yet"),
+                     "uptime": (clock((now if running else bot.ended_at or now) - bot.started_at)
+                                if bot.started_at else "–",
+                                f"since {hhmm(bot.started_at)}" if bot.started_at else "")}
         else:
-            time.sleep(0.1)
+            stats = {key: ("–", "") for key in ("attempts", "joins", "uptime")}
+        for key, (v, s) in stats.items():
+            self.kpi[key][0].configure(text=v, text_color=TEXT if v != "–" else MUTED)
+            self.kpi[key][1].configure(text=s)
+
+        self.pause_btn.configure(text="Resume" if running and bot.paused else "Pause")
+        if running != self.was_running:  # settings are locked while the bot uses them
+            self.was_running = running
+            if running:
+                self.start_btn.configure(text="Stop", fg_color="transparent", hover_color=RAISED,
+                                         border_color=CONTROL, text_color=TEXT)
+            else:  # the one filled control: inverted white, as the style's primary
+                self.start_btn.configure(text="Start", fg_color=TEXT, hover_color="#e2e2e4",
+                                         border_color=TEXT, text_color="#000000")
+            self.pause_btn.configure(state="normal" if running else "disabled")
+            self.server.configure(state="disabled" if running else "normal",
+                                  text_color=MUTED if running else TEXT)
+            for sw in self.switches:
+                sw.configure(state="disabled" if running else "normal")
+            for tab, _ in self.tabs.values():
+                tab.configure(cursor="arrow" if running else "hand2")
+            self.locked.configure(text="Locked while running" if running else "")
+            self._title()
+        self.ticks += 1
+        if self.ticks % 5 == 0:
+            self._draw_strip()
+        self.root.after(100, self._refresh)
+
+    def _hover(self, event):
+        self.hover_x = event.x if str(event.type) == "Motion" else None
+        self._draw_strip()
+
+    def _draw_strip(self):
+        c, k = self.strip, self.scale
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 50:
+            return
+        c.delete("all")
+        now, bot = time.time(), self.bot
+        t0 = now - STRIP_SPAN
+        events = list(bot.events) if bot else []
+        end = now if self.running() or not bot else (bot.ended_at or now)
+        base, top = h - 20 * k, 2 * k
+
+        def x_of(t):
+            return (t - t0) / STRIP_SPAN * (w - 2) + 1
+
+        # Five-minute grid, labelled on the minute, first and last label pulled inside the plot.
+        for t in range((int(t0) // 300 + 1) * 300, int(now) + 1, 300):
+            x = x_of(t)
+            c.create_line(x, top, x, base, fill=GRID)
+            anchor = "nw" if x < 24 * k else "ne" if x > w - 24 * k else "n"
+            c.create_text(x, base + 5 * k, text=hhmm(t), fill=MUTED, font=self.tick_font, anchor=anchor)
+
+        spans = [(max(a, t0), b) for a, b in game_spans(events, end) if b > t0]
+        for a, b in spans:
+            c.create_rectangle(x_of(a), base - 8 * k, max(x_of(b), x_of(a) + 2), base, fill=POSITIVE, width=0)
+        marks = []
+        for start, stop, outcome in join_attempts(events):
+            if start >= t0:
+                marks.append((x_of(start), start, stop, outcome or "pending"))
+        for t, ev in events:
+            if ev == "disconnected" and t >= t0:
+                marks.append((x_of(t), t, None, "dropped"))
+        hovered = min(marks, key=lambda m: abs(m[0] - self.hover_x), default=None) if self.hover_x is not None else None
+        if hovered and abs(hovered[0] - self.hover_x) > 8 * k:
+            hovered = None
+        for m in marks:
+            x = m[0]
+            colour = TEXT if m is hovered else NEGATIVE if m[3] == "dropped" else ACCENT
+            c.create_line(x, top if m[3] == "dropped" else base - 34 * k, x, base, fill=colour, width=max(1, round(2 * k)))
+        c.create_line(0, base, w, base, fill=CONTROL)  # the baseline, the one heavier line
+
+        if not marks and not spans:
+            note = c.create_text(w / 2, (top + base) / 2, text="No join attempts in the last 30 minutes.",
+                                 fill=MUTED, font=self.note_font)
+            x1, y1, x2, y2 = c.bbox(note)
+            c.tag_lower(c.create_rectangle(x1 - 12 * k, y1, x2 + 12 * k, y2, fill=SURFACE, width=0), note)
+        if hovered:
+            x, start, stop, outcome = hovered
+            text = {"rejected": f"Rejected after {stop - start:.1f} s" if stop else "Rejected",
+                    "joined": f"Joined after {stop - start:.1f} s" if stop else "Joined",
+                    "pending": "Connecting…", "dropped": "Dropped from the server"}[outcome]
+            label = f"{hhmm(start, seconds=True)}  {text}"
+            tx = x + 8 * k if x < w / 2 else x - 8 * k
+            item = c.create_text(tx, top + 4 * k, text=label, fill=TEXT, font=self.note_font,
+                                 anchor="nw" if x < w / 2 else "ne")
+            x1, y1, x2, y2 = c.bbox(item)
+            box = c.create_rectangle(x1 - 6 * k, y1 - 3 * k, x2 + 6 * k, y2 + 3 * k, fill=RAISED, width=0)
+            c.tag_lower(box, item)
+
+        shown = {"attempt": any(m[3] != "dropped" for m in marks), "game": bool(spans),
+                 "dropped": any(m[3] == "dropped" for m in marks)}
+        for kind in ("dropped", "game", "attempt"):
+            self.legend[kind].pack_forget()
+        for kind in ("dropped", "game", "attempt"):
+            if shown[kind]:
+                self.legend[kind].pack(side="right", padx=(14, 0))
+
+
+def cmd_gui(args):
+    hide_own_console()
+    App(args.log).root.mainloop()
 
 
 def main():
-    sys.stdout.reconfigure(errors="replace")  # OCR text can contain characters the console can't show
+    if sys.stdout:  # None in an exe built without a console
+        sys.stdout.reconfigure(errors="replace")  # OCR text can contain characters the console can't show
     p = argparse.ArgumentParser(description="Fully automated join/rejoin bot for The Isle (Evrima).")
     p.add_argument("--log", default=LOG_PATH, help="path to TheIsle.log")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")  # no command: open the window
+    sub.add_parser("gui", help="open the window (the default with no command)")
     r = sub.add_parser("run", help="join and keep rejoining automatically")
     r.add_argument("--server", help="part of the server's name as shown in the server list (saved)")
     r.add_argument("--exit-on-join", action="store_true", help="stop once you're in")
@@ -926,7 +1591,8 @@ def main():
     sub.add_parser("status", help="show the game state from the log")
     sub.add_parser("stop", help="stop a running bot (no hotkey needed)")
     args = p.parse_args()
-    {"run": cmd_run, "scan": cmd_scan, "status": cmd_status, "stop": cmd_stop}[args.cmd](args)
+    commands = {"run": cmd_run, "scan": cmd_scan, "status": cmd_status, "stop": cmd_stop, "gui": cmd_gui}
+    commands[args.cmd or "gui"](args)
 
 
 if __name__ == "__main__":

@@ -2,3 +2,6 @@
 __pycache__/
 *.py[cod]
 *.log
+.agents/
+.taste-skill/
+skills-lock.json

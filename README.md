@@ -19,12 +19,9 @@ Fully automated join / rejoin bot for The Isle (Evrima). Start it once and leave
 ## Quick start (no Python needed)
 
 1. Download `isle_reconnect.exe` from the [latest release](https://github.com/WeismannS/TheIsleConnect/releases/latest) into its own folder
-2. Open a terminal in that folder and run:
-```cmd
-isle_reconnect.exe run --server "part of the server name"
-```
+2. Double-click it, type part of the server's name, and press **Start**
 
-All the commands below work the same way with `isle_reconnect.exe` in place of `python isle_reconnect.py`. The config file is created next to the exe.
+Prefer the console? All the commands below work the same way with `isle_reconnect.exe` in place of `python isle_reconnect.py`. The config file is created next to the exe.
 
 ## Setup (from source)
 
@@ -46,10 +43,22 @@ pip install -r requirements.txt
 **3. Run**
 
 ```cmd
+python isle_reconnect.py
+```
+
+opens the window. Or skip it and run the bot in the console:
+
+```cmd
 python isle_reconnect.py run --server "part of the server name"
 ```
 
 The server name is saved to `isle_reconnect.json`, so after the first run `python isle_reconnect.py run` is enough.
+
+## The window
+
+A dark monitor built with [customtkinter](https://github.com/TomSchimansky/CustomTkinter): what the bot is doing and since when, attempt / join counters, a strip of every join attempt in the last 30 minutes (hover a tick for its time and result), and the activity log. Type part of the server's name, pick the session filter, and press **Start**. **Pause** / **Stop** do the same as the hotkeys, **Scan screen** prints what OCR sees (handy when the bot can't find something), and **Config file** (top right) opens `isle_reconnect.json` in Notepad. The settings are saved when you press Start.
+
+To build the exe yourself: `pip install pyinstaller` then `pyinstaller --onefile --collect-data customtkinter isle_reconnect.py`. Double-clicking it opens the window without a console; run from a terminal, it takes the commands below.
 
 ## Hotkeys
 
@@ -66,6 +75,7 @@ Change them under `hotkeys` in `isle_reconnect.json` (any of F1-F24, PAUSE, SCRO
 
 | Command | What it does |
 |---------|--------------|
+| *(none)* or `gui` | Open the window |
 | `run [--server NAME]` | Join and keep rejoining automatically |
 | `run --exit-on-join` | Stop once you're in |
 | `run --rejoin-after-leave` | Rejoin even when you leave or safe-log yourself (saved) |
