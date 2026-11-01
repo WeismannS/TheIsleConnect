@@ -70,7 +70,7 @@ Its **Game** tab edits The Isle's own settings files in `%LOCALAPPDATA%\TheIsle\
 - **Hidden effects**: bloom and lens flare. The game reads both from `GameUserSettings.ini`, but its menu doesn't show them.
 - **Engine tweaks**: ambient occlusion, depth of field, chromatic aberration and film grain off, and sharpening, written to `Engine.ini` under `[SystemSettings]`. These haven't been tested on the current build, which may ignore them.
 
-Close the game before saving: it rewrites these files when it exits, so the tab refuses to save while the game runs. Only the values you change are written. The first change keeps the original file next to it as `.bak`. Grass and foliage density aren't offered: the game resets them on every map load.
+The game reads `Engine.ini` when it starts, then rewrites it while running with only its own lines, which drops these settings. So the app keeps the Game tab's settings itself, in `isle_reconnect.json`, and writes them back whenever the game is closed: when the app starts, a few seconds after the game exits, and before the bot relaunches it. You can save while the game is open: changes are written once it closes, so keep the window open until then. Only the values you change are written. The first change keeps the original file next to it as `.bak`. Grass and foliage density aren't offered: the game resets them on every map load.
 
 To build the exe yourself: `pip install pyinstaller` then `pyinstaller --onefile --collect-data customtkinter --exclude-module PIL --exclude-module numpy isle_reconnect.py` (the two excludes keep out optional libraries the app never uses, about 17 MB). Double-clicking it opens the window without a console; run from a terminal, it takes the commands below.
 

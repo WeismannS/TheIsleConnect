@@ -82,6 +82,11 @@ DEFAULT_CONFIG = {
     "safe_log": {"hunger": 0, "thirst": 0, "key": "H", "hold_seconds": 2.0},
     # Brightens the screen in dark scenes while the game is in front: Off / Low / Medium / High.
     "adaptive_brightness": "Off",
+    # The Game tab's settings, as {ini section: {key: value}}. game_engine is kept and written back into
+    # Engine.ini whenever the game is closed (it drops those lines while it runs); game_pending holds
+    # GameUserSettings.ini changes made while the game was open, written once it closes.
+    "game_engine": {},
+    "game_pending": {},
 }
 
 VK_RETURN = 0x0D
@@ -1104,6 +1109,36 @@ class GameIni:
         return True
 
 
+def engine_keys():
+    """Every (section, key) the Game tab owns in Engine.ini."""
+    keys = {(SYSTEM, cvar) for cvar, *_ in ENGINE_TWEAKS + VISIBILITY_TWEAKS}
+    for _, _, presets in [FOG_DETAIL, *VISIBILITY_CHOICES]:
+        for preset in presets.values():
+            keys |= set(preset)
+    return keys
+
+
+def overlay(ini, sections):
+    """Sets {section: {key: value}} on a GameIni; a None value removes the key."""
+    for section, values in sections.items():
+        for key, value in values.items():
+            ini.set(section, key, value)
+
+
+def sync_game_files(cfg):
+    """Writes what the app keeps for the game into its files. Only while the game is closed: it
+    rewrites Engine.ini while it runs, keeping just its own lines, so the app is the record and
+    puts them back. GameUserSettings changes are one-off ("game_pending"); Engine.ini is kept as
+    "game_engine". Returns the names of the files written."""
+    if not os.path.exists(GAME_SETTINGS):  # the game has never saved its settings here
+        return []
+    gus, eng = GameIni(GAME_SETTINGS), GameIni(GAME_ENGINE)
+    overlay(gus, cfg["game_pending"])
+    for section, key in engine_keys():
+        eng.set(section, key, cfg["game_engine"].get(section, {}).get(key))
+    return [os.path.basename(ini.path) for ini in (gus, eng) if ini.save()]
+
+
 # --- Adaptive brightness -----------------------------------------------------
 
 # How far dark scenes are brightened: the screen gamma at full darkness (1.0 = unchanged).
@@ -1406,6 +1441,14 @@ class Bot:
         if not self.game_running:
             if now - self.last_seen_game > 5 and now - self.launched_at > cfg["launch_timeout"]:
                 log("Game is not running - launching it through Steam")
+                try:  # the Game tab's settings first: the game dropped the Engine.ini ones while it ran
+                    fresh = load_config(None)
+                    if not game_process_running():
+                        sync_game_files(fresh)
+                        fresh["game_pending"] = {}
+                        save_config(fresh)
+                except OSError as e:
+                    log(f"Couldn't write the game's settings: {e.strerror}")
                 os.startfile(STEAM_LAUNCH)
                 self.launched_at = now
                 nav.reset()
@@ -1744,6 +1787,7 @@ class App:
         self.hotkeys = cfg["hotkeys"]
         self.brightness = AutoBrightness()
         self.brightness.set_level(cfg["adaptive_brightness"])
+        self.game_open = True  # so the first check puts the Game tab's settings back if the game is closed
         ctk.set_appearance_mode("dark")
         self.root = root = ctk.CTk(fg_color=GROUND)
         root.title("Isle Auto-Connect")
@@ -1975,6 +2019,7 @@ class App:
         log("Ready.")
         self._title()
         self._refresh()
+        self._watch_game()
         root.update_idletasks()  # open at the height the content asks for; customtkinter sizes are unscaled
         height = round(root.winfo_reqheight() / k)
         root.geometry(f"1120x{height}")
@@ -2046,8 +2091,8 @@ class App:
         head.grid(row=0, column=0, sticky="ew", padx=32, pady=(24, 8))
         ctk.CTkLabel(head, text="More settings", font=font(20, semi), text_color=TEXT, height=28).pack(anchor="w")
         notes = {"Bot": "Saved to isle_reconnect.json. They apply the next time you press Start.",
-                 "Game": "Written to The Isle's own settings files. Close the game first; "
-                         "it picks them up on its next start."}
+                 "Game": "Kept by this app and written to The Isle's files whenever the game is "
+                         "closed. They apply the next time it starts."}
         note = ctk.CTkLabel(head, text="", font=font(13), text_color=MUTED, height=20)
         note.pack(anchor="w")
 
@@ -2161,8 +2206,13 @@ class App:
             section(game, "No game settings yet", "The Isle hasn't saved its settings on this PC. "
                                                   "Start it once, close it, and come back here.")
         else:
+            # What the tab shows: the game's files with the app's own record laid over them, because
+            # the game drops the Engine.ini lines while it runs.
             gus = game_ini["settings"] = GameIni(GAME_SETTINGS)
             eng = game_ini["engine"] = GameIni(GAME_ENGINE)
+            overlay(gus, cfg["game_pending"])
+            for part, key in engine_keys():
+                eng.set(part, key, cfg["game_engine"].get(part, {}).get(key))
             levels = ["Low", "Medium", "High", "Epic"]
             section(game, "Quality", "The same levels as the game's menu. Foliage and landscape cost the most "
                                      "frames; textures cost almost none on a card with 8 GB.")
@@ -2257,13 +2307,19 @@ class App:
         self.text_button(foot, "Open config file", self.edit_config).pack(side="left")
 
         def game_changes():
-            """Applies the Game tab to the ini files in memory. Returns an error, or None."""
+            """Reads the Game tab into (GameUserSettings changes, Engine.ini settings), both as
+            {section: {key: value}}, or returns an error string."""
             if not game_ini:
-                return None
+                return {}, {}
             gus, eng = game_ini["settings"], game_ini["engine"]
+            changes = {}
+
+            def gus_set(section, key, value):
+                changes.setdefault(section, {})[key] = value
+
             for key, state in quality.items():
                 if state["value"] != state["was"]:
-                    gus.set("ScalabilityGroups", key, state["value"])
+                    gus_set("ScalabilityGroups", key, state["value"])
             try:
                 limit = float(fps[1].get() or 0)
             except ValueError:
@@ -2271,15 +2327,15 @@ class App:
             if not 0 <= limit <= 1000:
                 return "The frame rate limit runs from 0 (none) to 1000."
             if abs(limit - fps[0]) > 1e-6:
-                gus.set("/Script/Engine.GameUserSettings", "FrameRateLimit", f"{limit:.6f}")
+                gus_set("/Script/Engine.GameUserSettings", "FrameRateLimit", f"{limit:.6f}")
             for key, (held, var) in effects.items():
                 if var.get() and held == "0":
-                    gus.set("/Script/Engine.RendererSettings", key, None)  # back to the game's own value
+                    gus_set("/Script/Engine.RendererSettings", key, None)  # back to the game's own value
                 elif not var.get() and held != "0":
-                    gus.set("/Script/Engine.RendererSettings", key, "0")
+                    gus_set("/Script/Engine.RendererSettings", key, "0")
             for key, (held, var) in physics.items():
                 if var.get() != (held == "True"):
-                    gus.set("/Script/Engine.GameUserSettings", key, "True" if var.get() else "False")
+                    gus_set("/Script/Engine.GameUserSettings", key, "True" if var.get() else "False")
             for state in choices:
                 if state["value"] != state["was"]:
                     preset = state["presets"][state["value"]]
@@ -2290,11 +2346,12 @@ class App:
                     eng.set(SYSTEM, key, value)
                 elif not var.get() and held == value:
                     eng.set(SYSTEM, key, None)
-            if any(ini.changed() for ini in game_ini.values()) and game_process_running():
-                for ini in game_ini.values():
-                    ini.lines = list(ini.original)
-                return "Close The Isle first: it rewrites its settings files when it exits."
-            return None
+            engine = {}
+            for part, key in engine_keys():
+                value = eng.get(part, key)
+                if value is not None:
+                    engine.setdefault(part, {})[key] = value
+            return changes, engine
 
         def save():
             if keys["quit"].get() == keys["pause"].get():
@@ -2305,17 +2362,17 @@ class App:
                 return error.configure(text="Waits are whole seconds.")
             if not (10 <= waits[0] <= 3600 and 30 <= waits[1] <= 3600):
                 return error.configure(text="Waits run from 10 s (30 s for a relaunch) to 3600 s.")
-            problem = game_changes()
-            if problem:
+            game_settings = game_changes()
+            if isinstance(game_settings, str):
                 pick_page("Game")
-                return error.configure(text=problem)
-            try:
-                written = [os.path.basename(ini.path) for ini in game_ini.values() if ini.save()]
-            except OSError as e:
-                return error.configure(text=f"Couldn't write the game's settings: {e.strerror}")
-            if written:
-                log("Game settings written to " + " and ".join(written) + ". They apply when The Isle starts.")
+                return error.configure(text=game_settings)
             cfg = load_config(None)  # fresh, so nothing the main window saved since is lost
+            changes, cfg["game_engine"] = game_settings if game_ini else ({}, cfg["game_engine"])
+            for part, values in changes.items():
+                cfg["game_pending"].setdefault(part, {}).update(values)
+            if game_ini and not self._sync_game(cfg):
+                log("Game settings saved. The Isle is open, so they're written when it closes "
+                    "(keep this window open until then).")
             cfg["hotkeys"] = {action: var.get() for action, var in keys.items()}
             cfg["join_timeout"], cfg["launch_timeout"] = waits
             cfg["ocr_scale"] = scale["value"]
@@ -2347,6 +2404,39 @@ class App:
         self.view.configure(state="normal")
         self.view.delete("1.0", "end")
         self.view.configure(state="disabled")
+
+    def _sync_game(self, cfg, quiet=False):
+        """Writes the Game tab's settings into the game's files if the game is closed, saving cfg.
+        Returns False while the game runs (nothing written)."""
+        if game_process_running():
+            save_config(cfg)
+            return False
+        try:
+            written = sync_game_files(cfg)
+        except OSError as e:
+            log(f"Couldn't write the game's settings: {e.strerror}")
+            save_config(cfg)
+            return True
+        cfg["game_pending"] = {}
+        save_config(cfg)
+        if written and not quiet:
+            log("Game settings written to " + " and ".join(written) + ". They apply when The Isle starts.")
+        elif written:
+            log("Put the Game tab's settings back into " + " and ".join(written) + " (the game drops them "
+                "while it runs).")
+        return True
+
+    def _watch_game(self):
+        """Every few seconds: once the game has closed, put the Game tab's settings back."""
+        def check():
+            running = game_process_running()
+            if self.game_open and not running:
+                cfg = load_config(None)
+                self._sync_game(cfg, quiet=True)
+            self.game_open = running
+
+        self._background(check)
+        self.root.after(3000, self._watch_game)
 
     def close(self):
         self.brightness.stop()  # your own screen gamma back

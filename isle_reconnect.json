@@ -69,5 +69,7 @@
     "key": "H",
     "hold_seconds": 2.0
   },
-  "adaptive_brightness": "Off"
+  "adaptive_brightness": "Off",
+  "game_engine": {},
+  "game_pending": {}
 }

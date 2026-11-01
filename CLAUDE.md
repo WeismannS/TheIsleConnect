@@ -67,11 +67,16 @@ Never commit the user's local file.
 - times out `joining` / `loading` by checking the screen (`_where`)
 - in `menu` / `starting`: ticks the Navigator and escalates when nothing is recognised (Esc at 45 s, game restart at 3 min)
 
-**Game settings (`GameIni`, the More settings dialog's Game tab)** edit the game's `GameUserSettings.ini` / `Engine.ini` line by line, never through a parser: Unreal inis repeat keys (`ActionMappings`). The files are UTF-8 without a BOM, with CRLF line endings. Only changed values are written, and the first write keeps a `.bak`. Saving is refused while `game_process_running()`, because the game rewrites the files on exit. Found by disassembling the exe:
+**Game settings (`GameIni`, the More settings dialog's Game tab)** edit the game's `GameUserSettings.ini` / `Engine.ini` line by line, never through a parser: Unreal inis repeat keys (`ActionMappings`). The files are UTF-8 without a BOM, with CRLF line endings. Only changed values are written, and the first write keeps a `.bak`. **The game rewrites `Engine.ini` while it runs, keeping only its own lines.** This was observed: on joining a server it rewrote the file to update `CachedClientID`, and our `[SystemSettings]` and `[/Script/Engine.Engine]` lines were gone.
+- It does read them at startup: after a save, changes were visible in game. Which keys took effect hasn't been confirmed one by one.
+- The app's config is therefore the record: `game_engine` holds the Engine.ini keys we own (`engine_keys()`), and `game_pending` holds GameUserSettings changes saved while the game was open.
+- `sync_game_files()` writes both, only while the game is closed. It runs on app start, a few seconds after the game exits (`App._watch_game`), after Save, and in `Bot._step` before a relaunch.
+- Don't make Engine.ini read-only instead: the game needs to update `CachedClientID` between connections.
+
+Found by disassembling the exe:
 - `BloomQuality` / `LensFlareQuality` / `MotionBlurQuality` in `[/Script/Engine.RendererSettings]` run the matching `r.*` command.
 - `[CustomVariables]` only holds mouse sensitivity.
 - On every map load and every settings apply, the game resets `r.Nanite`, `r.ShadowQuality`, `r.Water.SingleLayer`, `grass.*` and `foliage.DensityScale`. Don't offer those.
-- Whether `Engine.ini` `[SystemSettings]` is honoured is untested.
 
 **Adaptive brightness (`AutoBrightness`)** is a thread owned by `App`.
 - It measures the middle 60% of the game's client area: a 48×27 HALFTONE `StretchBlt` from the screen DC.
