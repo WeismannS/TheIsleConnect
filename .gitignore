@@ -5,3 +5,4 @@ __pycache__/
 .agents/
 .taste-skill/
 skills-lock.json
+isle_reconnect_gamma.bin

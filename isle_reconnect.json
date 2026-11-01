@@ -68,5 +68,6 @@
     "thirst": 0,
     "key": "H",
     "hold_seconds": 2.0
-  }
+  },
+  "adaptive_brightness": "Off"
 }

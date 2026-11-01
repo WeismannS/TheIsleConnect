@@ -80,6 +80,8 @@ DEFAULT_CONFIG = {
     # Safe-log when hunger or thirst (read from the HUD) drops to this many percent; 0 turns it off.
     # Safe-logging taps the key to rest, then holds it to sleep; the server lets you out after 60 s.
     "safe_log": {"hunger": 0, "thirst": 0, "key": "H", "hold_seconds": 2.0},
+    # Brightens the screen in dark scenes while the game is in front: Off / Low / Medium / High.
+    "adaptive_brightness": "Off",
 }
 
 VK_RETURN = 0x0D
@@ -131,6 +133,7 @@ kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
 user32.IsHungAppWindow.argtypes = [wintypes.HWND]
+user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -313,13 +316,19 @@ class Game:
             kernel32.CloseHandle(h)
         self.hwnd = None
 
+    def post_key(self, vk, seconds=0.05):
+        """Presses a key for `seconds`, posted to the game window alone: it works with the game in
+        the background, needs no focus, and can't land in another app."""
+        down = 1 | user32.MapVirtualKeyW(vk, 0) << 16  # repeat count 1, scan code
+        user32.PostMessageW(self.hwnd, 0x0100, vk, down)  # WM_KEYDOWN
+        end = time.time() + seconds
+        while time.time() < end:  # repeats while held, as a real key does
+            time.sleep(0.05)
+            user32.PostMessageW(self.hwnd, 0x0100, vk, down | 1 << 30)  # was already down
+        user32.PostMessageW(self.hwnd, 0x0101, vk, down | 3 << 30)  # WM_KEYUP
+
     def hold_key(self, key, seconds):
-        """Holds a letter key down for `seconds`. Sent as a scan code: games read those, not virtual keys."""
-        self.focus()
-        scan = user32.MapVirtualKeyW(ord(key.upper()), 0)
-        _send(_key(scan=scan, flags=0x8))  # KEYEVENTF_SCANCODE
-        time.sleep(seconds)
-        _send(_key(scan=scan, flags=0x8 | 2))  # | KEYEVENTF_KEYUP
+        self.post_key(ord(key.upper()), seconds)
 
     def type_text(self, text):
         self.focus()
@@ -419,9 +428,10 @@ kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 # --- Hunger / thirst ---------------------------------------------------------
 
 # The HUD's stomach and water-drop icons (bottom right) fill with pale cyan from the bottom up.
-# The band each fill moves in, as (left, top, right, bottom) pixels in from the window's
-# bottom-right corner at 1080p; the HUD scales with the window height.
-STAT_ICONS = {"hunger": (163, 232, 86, 173), "thirst": (114, 163, 54, 99)}
+# The band each fill moves in from 0 to 100%, as (left, top, right, bottom) pixels in from the
+# window's bottom-right corner at 1080p; the HUD scales with the window height. Fitted to the
+# game's own tooltip values: the stomach's 0% line sits a few pixels below its drawn bottom.
+STAT_ICONS = {"hunger": (163, 236, 86, 169), "thirst": (114, 163, 54, 99)}
 
 
 def read_stats(game):
@@ -440,7 +450,9 @@ def read_stats(game):
             for i in range(0, len(row), 4):
                 b, g, r = row[i], row[i + 1], row[i + 2]
                 cyan += g > 170 and b > 170 and b > r + 20  # the glowing outline, or the fill
-                fill += g > 200 and b > 200 and r > 150 and b > r + 10  # the pale fill
+                # The fill is near-white (its brightness follows the scene); the outline's glow can
+                # be as bright but is a saturated cyan, so whiteness tells them apart.
+                fill += r > 180 and g > 210 and b > 210 and g - r < 40
                 red += r >= 230 and g < 70 and b < 70  # empty: the icon turns red
             drawn += cyan >= 3
             if gap <= 3 * k and fill >= 4 * k and fill >= 0.35 * cyan:
@@ -454,7 +466,7 @@ def read_stats(game):
         elif fill_top is None:
             stats[stat] = 0
         else:
-            stats[stat] = min(100, round(100 * (bottom - fill_top + 1) / (bottom - top + 1)))
+            stats[stat] = min(100, round(100 * (bottom - fill_top) / (bottom - top)))
     return stats
 
 
@@ -478,11 +490,11 @@ def chat_open(image):
     w, h, data, scale = image
     k = h / 1080
     y = h - round(16 * k)
-    row = [data[(y * w + round(x * k)) * 4:(y * w + round(x * k)) * 4 + 3] for x in range(100, 600, 25)]
+    row = [data[(y * w + round(x * k)) * 4:(y * w + round(x * k)) * 4 + 3] for x in range(100, 400, 25)]
     return min(sum(px) / 3 for px in row) > 150
 
 
-def read_exact(game, ocr, stats):
+def read_exact(game, ocr, stats):  # only for `stats --exact`; the bot itself never needs it
     """Exact values from the game's own tooltips: open chat (Enter) to free the cursor, hover each
     icon, OCR the "16.63 %" that appears up and to the right of it, close chat (Enter again; Esc
     would open the pause menu). The tooltip is its own window, so this captures the screen; the
@@ -955,6 +967,257 @@ class Navigator:
         self.last_seen, self.warned, self.esc_sent = time.time(), False, False
 
 
+# --- The game's own settings -------------------------------------------------
+
+GAME_CONFIG_DIR = os.path.expandvars(r"%LOCALAPPDATA%\TheIsle\Saved\Config\WindowsClient")
+GAME_SETTINGS = os.path.join(GAME_CONFIG_DIR, "GameUserSettings.ini")
+GAME_ENGINE = os.path.join(GAME_CONFIG_DIR, "Engine.ini")
+# The game's graphics levels, as its menu shows them (0 Low .. 3 Epic), in [ScalabilityGroups].
+GAME_QUALITY = [("sg.ViewDistanceQuality", "View distance"), ("sg.ShadowQuality", "Shadows"),
+                ("sg.TextureQuality", "Textures"), ("sg.EffectsQuality", "Effects"),
+                ("sg.FoliageQuality", "Foliage"), ("sg.ShadingQuality", "Shading"),
+                ("sg.LandscapeQuality", "Landscape")]
+# Read by the game from [/Script/Engine.RendererSettings] in GameUserSettings.ini, but missing from
+# its menu (found in the exe: each runs the r.* command of the same name). 0 turns the effect off;
+# no key leaves it to the game.
+HIDDEN_EFFECTS = [("BloomQuality", "Bloom", "glow around the sun and bright light"),
+                  ("LensFlareQuality", "Lens flare", "rings and streaks from the sun")]
+# The game's foliage physics switches (True/False in [/Script/Engine.GameUserSettings]); all cost CPU.
+FOLIAGE_PHYSICS = [("PhysicsFoliage", "Plants move as you pass", "your dino only"),
+                   ("PhysicsFoliageAllPlayers", "Plants move for everyone", "costs the most CPU"),
+                   ("PhysicsGrass", "Grass bends", "")]
+# Engine.ini choices shown as tabs, as (name, hint, {label: {(section, key): value}}). The first label
+# is "Game": it removes the keys, leaving the game's own value.
+SYSTEM, ENGINE = "SystemSettings", "/Script/Engine.Engine"
+# Volumetric fog drawn on a coarser grid: as thick as before, cheaper, slightly blockier at the edges.
+FOG_DETAIL = ("Fog detail", None, {
+    "Game": {},
+    "Lower": {(SYSTEM, "r.VolumetricFog.GridPixelSize"): "12", (SYSTEM, "r.VolumetricFog.GridSizeZ"): "96"},
+    "Lowest": {(SYSTEM, "r.VolumetricFog.GridPixelSize"): "16", (SYSTEM, "r.VolumetricFog.GridSizeZ"): "64"}})
+# Settings servers ban for, for private / sandbox servers. DisplayGamma is a plain engine property
+# (default 2.2), so it doesn't depend on ini cvars being honoured. Grass and foliage density are left
+# out: the game resets grass.*, foliage.DensityScale and r.ShadowQuality on every map load.
+VISIBILITY_CHOICES = [
+    ("Night brightness", "display gamma", {"Game": {}, "Brighter": {(ENGINE, "DisplayGamma"): "2.8"},
+                                           "Brightest": {(ENGINE, "DisplayGamma"): "3.4"}}),
+    ("Draw distance", "everything, farther", {"Game": {}, "Far": {(SYSTEM, "r.ViewDistanceScale"): "2"},
+                                              "Farthest": {(SYSTEM, "r.ViewDistanceScale"): "4"}})]
+VISIBILITY_TWEAKS = [("r.Fog", "0", "Height fog off", "the haze over distance"),
+                     ("r.VolumetricFog", "0", "Volumetric fog off", "fog banks and mist"),
+                     ("r.VolumetricCloud", "0", "Clouds off", "also saves GPU")]
+# Engine.ini [SystemSettings] cvars, as (cvar, value, name, hint). Untested: a build can ignore ini cvars.
+ENGINE_TWEAKS = [("r.AmbientOcclusionLevels", "0", "Ambient occlusion off", "saves ~0.3-0.8 ms"),
+                 ("r.DepthOfFieldQuality", "0", "Depth of field off", "no background blur"),
+                 ("r.SceneColorFringeQuality", "0", "Chromatic aberration off", "no colour fringes"),
+                 ("r.FilmGrain", "0", "Film grain off", "a cleaner image"),
+                 ("r.Tonemapper.Sharpen", "0.5", "Sharpen", "offsets DLSS softness")]
+
+kernel32.K32EnumProcesses.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+                                      ctypes.POINTER(wintypes.DWORD)]
+
+
+def game_process_running():
+    """Whether The Isle's process exists at all, window or not: it rewrites its ini files on exit."""
+    pids = (wintypes.DWORD * 8192)()
+    size = wintypes.DWORD()
+    if not kernel32.K32EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(size)):
+        return False
+    return any(pid_name(pid) == GAME_EXE for pid in pids[:size.value // 4])
+
+
+class GameIni:
+    """One of the game's ini files, edited line by line. Unreal's inis repeat keys (ActionMappings),
+    so a parser would mangle them; everything not set here is kept exactly as it was."""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            with open(path, encoding="utf-8-sig", newline="") as f:
+                self.lines = f.read().splitlines()
+        except FileNotFoundError:
+            self.lines = [";METADATA=(Diff=true, UseCommands=true)"]
+        self.original = list(self.lines)
+
+    def _section(self, section):
+        """(header index, end index) of [section], or None. The end includes trailing blank lines."""
+        start = None
+        for i, line in enumerate(self.lines):
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                if start is not None:
+                    return start, i
+                if s[1:-1] == section:
+                    start = i
+        return None if start is None else (start, len(self.lines))
+
+    def _find(self, section, key):
+        span = self._section(section)
+        if span:
+            for i in range(span[0] + 1, span[1]):
+                k, sep, _ = self.lines[i].partition("=")
+                if sep and k.strip() == key:
+                    return i
+        return None
+
+    def get(self, section, key):
+        i = self._find(section, key)
+        return None if i is None else self.lines[i].partition("=")[2].strip()
+
+    def set(self, section, key, value):
+        """Sets section.key to value; None removes the key, and the section once it's empty."""
+        i = self._find(section, key)
+        if i is not None:
+            if value is not None:
+                self.lines[i] = f"{key}={value}"
+                return
+            del self.lines[i]
+            start, end = self._section(section)
+            if not any(line.strip() for line in self.lines[start + 1:end]):
+                del self.lines[start:end]
+        elif value is not None:
+            span = self._section(section)
+            if span:
+                end = span[1]
+                while end > span[0] + 1 and not self.lines[end - 1].strip():
+                    end -= 1
+                self.lines.insert(end, f"{key}={value}")
+            else:
+                if self.lines and self.lines[-1].strip():
+                    self.lines.append("")
+                self.lines += [f"[{section}]", f"{key}={value}", ""]
+
+    def changed(self):
+        return self.lines != self.original
+
+    def save(self):
+        """Writes the file if anything changed. The first write keeps the file as it was in .bak."""
+        if not self.changed():
+            return False
+        backup = self.path + ".bak"
+        if os.path.exists(self.path) and not os.path.exists(backup):
+            with open(self.path, "rb") as src, open(backup, "wb") as dst:
+                dst.write(src.read())
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("\n".join(self.lines) + "\n")
+        self.original = list(self.lines)
+        return True
+
+
+# --- Adaptive brightness -----------------------------------------------------
+
+# How far dark scenes are brightened: the screen gamma at full darkness (1.0 = unchanged).
+BRIGHTNESS_LEVELS = {"Off": 1.0, "Low": 1.35, "Medium": 1.7, "High": 2.2}
+GAMMA_BACKUP = os.path.join(APP_DIR, "isle_reconnect_gamma.bin")  # your own ramp, while the brightener runs
+gdi32.GetDeviceGammaRamp.argtypes = [wintypes.HDC, ctypes.c_void_p]
+gdi32.SetDeviceGammaRamp.argtypes = [wintypes.HDC, ctypes.c_void_p]
+GammaRamp = wintypes.WORD * 768  # red, green, blue: 256 entries each
+
+
+class AutoBrightness:
+    """Brightens the screen while the game shows a dark scene, through the display's gamma ramp.
+
+    The ramp is applied on the way to the monitor, after Windows has composed the screen, so the
+    picture measured here (and every capture the bot takes) is never affected by it. It only acts while
+    the game is the foreground window, and puts your own ramp back otherwise. A copy of that ramp sits
+    in GAMMA_BACKUP from the first boost until the brightener stops, so if the process is killed, the
+    next start puts it back."""
+
+    DARK, LIGHT = 12, 60  # mean brightness (0-255) of the middle of the picture: full boost .. none
+
+    def __init__(self):
+        self.peak = 1.0  # the gamma at full darkness
+        self.gamma = 1.0  # what's applied now
+        self.ceiling = None  # the most Windows has accepted, once it has refused one
+        self.thread, self.halt = None, threading.Event()
+
+    def set_level(self, level):
+        self.peak = BRIGHTNESS_LEVELS.get(level, 1.0)
+        if self.peak > 1.0 and not (self.thread and self.thread.is_alive()):
+            self.halt.clear()
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        elif self.peak == 1.0:
+            self.stop()
+
+    def stop(self):
+        self.halt.set()
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(3)
+
+    def _run(self):
+        screen = user32.GetDC(None)
+        original = GammaRamp()
+        try:
+            if os.path.exists(GAMMA_BACKUP):  # the last run was killed with our ramp applied
+                with open(GAMMA_BACKUP, "rb") as f:
+                    ctypes.memmove(original, f.read(ctypes.sizeof(original)), ctypes.sizeof(original))
+                gdi32.SetDeviceGammaRamp(screen, original)
+            elif not gdi32.GetDeviceGammaRamp(screen, original):
+                log("Adaptive brightness: Windows won't share the screen's gamma; it stays off.")
+                return
+            game, last = Game(), time.time()
+            while not self.halt.wait(0.5):
+                now, target, step = time.time(), 1.0, 1.0  # tabbed out: your own screen back at once
+                if game.find() and user32.GetForegroundWindow() == game.hwnd:
+                    level = self._scene_level(game)
+                    if level is not None:
+                        t = min(max((self.LIGHT - level) / (self.LIGHT - self.DARK), 0.0), 1.0)
+                        target = min(1.0 + t * (self.peak - 1.0), self.ceiling or 9.0)
+                    step = min(1.0, (now - last) / 1.5)  # eases over ~1.5 s, so a flash doesn't flicker it
+                last = now
+                wanted = self.gamma + (target - self.gamma) * step
+                if abs(wanted - target) < 0.01:
+                    wanted = target
+                if abs(wanted - self.gamma) >= 0.01 or (wanted == target and wanted != self.gamma):
+                    self._apply(screen, original, wanted)
+        finally:
+            gdi32.SetDeviceGammaRamp(screen, original)
+            self.gamma = 1.0
+            try:
+                os.remove(GAMMA_BACKUP)
+            except OSError:
+                pass
+            user32.ReleaseDC(None, screen)
+
+    def _scene_level(self, game):
+        """Mean brightness of the middle of the game's picture, read small and fast from the screen."""
+        w, h = game.client_size()
+        if w < 200 or h < 200:
+            return None
+        sx, sy = game.to_screen(w * 0.2, h * 0.2)  # the middle 60%: no HUD, no chat
+        mem, bits, bmp, old = _dib(48, 27)
+        try:
+            src = user32.GetDC(None)
+            gdi32.SetStretchBltMode(mem, 4)  # HALFTONE: each pixel averages the area it covers
+            gdi32.StretchBlt(mem, 0, 0, 48, 27, src, sx, sy, int(w * 0.6), int(h * 0.6), 0x00CC0020)
+            user32.ReleaseDC(None, src)
+            data = ctypes.string_at(bits, 48 * 27 * 4)
+        finally:
+            gdi32.SelectObject(mem, old)
+            gdi32.DeleteObject(bmp)
+            gdi32.DeleteDC(mem)
+        return sum(0.114 * data[i] + 0.587 * data[i + 1] + 0.299 * data[i + 2]
+                   for i in range(0, len(data), 4)) / (48 * 27)
+
+    def _apply(self, screen, original, gamma):
+        """Your ramp raised to 1/gamma. Windows refuses ramps that stray too far from normal unless
+        the GdiIcmGammaRange registry value allows it, so a refusal lowers the ceiling and retries."""
+        if gamma > 1.0 and not os.path.exists(GAMMA_BACKUP):
+            with open(GAMMA_BACKUP, "wb") as f:
+                f.write(bytes(original))
+        capped = False
+        while True:
+            ramp = GammaRamp(*(round(65535 * (v / 65535) ** (1 / gamma)) for v in original))
+            if gdi32.SetDeviceGammaRamp(screen, ramp) or gamma <= 1.0:
+                self.gamma = gamma
+                if capped:
+                    log(f"Adaptive brightness: Windows caps how far it can brighten the screen, at "
+                        f"gamma {gamma:.2f} here. The GdiIcmGammaRange registry value lifts the cap.")
+                return
+            self.ceiling, gamma, capped = max(1.0, gamma - 0.05), max(1.0, gamma - 0.05), True
+
+
 # --- Commands ----------------------------------------------------------------
 
 
@@ -1009,11 +1272,15 @@ def cmd_stats(args):
     if not game.find():
         sys.exit("Game window not found.")
     estimate = read_stats(game)
-    print("Opening chat to read the exact values from the tooltips...")
-    exact = read_exact(game, Ocr(), list(STAT_ICONS))
+    exact = {}
+    if args.exact:
+        print("Opening chat to read the exact values from the tooltips...")
+        exact = read_exact(game, Ocr(), list(STAT_ICONS))
     for stat, value in estimate.items():
-        shown = "icon not on screen" if value is None else f"~{value}% from the icon"
-        print(f"{stat.capitalize():7} {shown}, " + (f"{exact[stat]:g}% exact" if stat in exact else "tooltip not read"))
+        shown = "icon not on screen" if value is None else f"{value}% from the icon"
+        if args.exact:
+            shown += ", " + (f"{exact[stat]:g}% exact" if stat in exact else "tooltip not read")
+        print(f"{stat.capitalize():7} {shown}")
 
 
 def cmd_stop(args):
@@ -1041,7 +1308,6 @@ class Bot:
         self.started_at = self.ended_at = None
         self.events = collections.deque(maxlen=5000)  # (time, kind) for the GUI's attempt strip
         self.stats, self.stats_at = {}, 0.0  # last hunger / thirst reading
-        self.exact_at, self.exact_ok = 0.0, {}  # last tooltip check; when each stat last read exactly
         self.armed, self.low = set(STAT_ICONS), {}  # see _watch_stats
         self.safe_log_started, self.safe_log_tries = None, 0
         self._stop = threading.Event()
@@ -1265,15 +1531,14 @@ class Bot:
         image = game.capture()
         if close_chat and chat_open(image):
             log("Chat is open - clearing and closing it")
-            game.focus()
-            game.clear_line()
-            game.tap(VK_RETURN)
+            for _ in range(100):  # posted Ctrl+A isn't seen as held, so empty it key by key
+                game.post_key(0x08, 0)
+            game.post_key(VK_RETURN)  # empty, so nothing is sent
             time.sleep(0.4)
             return True
-        _, pos = find_any(self.ocr.read(image), self.cfg["labels"]["resume"])
-        if pos:
-            log("Pause menu is open - closing it (Resume)")
-            game.click(*pos)
+        if find_any(self.ocr.read(image), self.cfg["labels"]["resume"])[0]:
+            log("Pause menu is open - closing it (Esc)")
+            game.post_key(0x1B)
             time.sleep(0.6)
             return True
         return False
@@ -1301,17 +1566,9 @@ class Bot:
             if self._clear_overlays(close_chat=False):
                 return  # read again next pass, with the HUD unblurred
         try:
+            # The icon estimate is within about a point of the game's own value, so the bot never
+            # needs focus or the tooltip: everything here works with the game in the background.
             self.stats = read_stats(game)
-            # The icon estimate runs a few points off, so near a limit confirm with the exact tooltip
-            # value. That opens chat for a moment, so at most every 30 s.
-            near = [stat for stat, limit in limits.items() if stat in self.armed
-                    and self.stats.get(stat) is not None and 0 < self.stats[stat] <= limit + 5]
-            exact = {stat: 0 for stat in limits if self.stats.get(stat) == 0}  # empty: no tooltip, nothing to check
-            if near and now - self.exact_at >= 30:
-                self.exact_at = now
-                exact = read_exact(game, self.ocr, near)
-                self.stats.update(exact)
-                self.exact_ok.update({stat: now for stat in exact})
         except OSError:
             return
         for stat, limit in limits.items():
@@ -1326,13 +1583,13 @@ class Bot:
                     log(f"{stat.capitalize()} is still at {value:g}% after the last safe-log - "
                         f"auto safe-log for it restarts once it's above {limit}%")
                     self.low[stat] = 0
-            elif stat in exact:
-                self._safe_log(game, f"{stat.capitalize()} at {value:g}% (limit {limit}%)")
+            elif value == 0:  # the icon turned red: empty, nothing to wait for
+                self._safe_log(game, f"{stat.capitalize()} is empty (limit {limit}%)")
                 return
-            elif now - self.exact_ok.get(stat, 0) > 60:  # tooltip unreadable: fall back on the icon
+            else:
                 self.low[stat] = self.low.get(stat, 0) + 1
                 if self.low[stat] >= 3:  # three readings in a row, so a stray frame can't log you out
-                    self._safe_log(game, f"{stat.capitalize()} at about {value}% (limit {limit}%)")
+                    self._safe_log(game, f"{stat.capitalize()} at {value}% (limit {limit}%)")
                     return
 
     def _safe_log(self, game, why):
@@ -1485,6 +1742,8 @@ class App:
 
         cfg = load_config(None)
         self.hotkeys = cfg["hotkeys"]
+        self.brightness = AutoBrightness()
+        self.brightness.set_level(cfg["adaptive_brightness"])
         ctk.set_appearance_mode("dark")
         self.root = root = ctk.CTk(fg_color=GROUND)
         root.title("Isle Auto-Connect")
@@ -1764,7 +2023,8 @@ class App:
         subprocess.Popen(["notepad.exe", CONFIG_PATH])
 
     def open_settings(self):
-        """The settings that otherwise live only in isle_reconnect.json, in a window of their own."""
+        """The settings that otherwise live only in isle_reconnect.json, and the game's own graphics
+        settings, in a window of their own with a tab for each."""
         if self.running():
             return
         if self.dialog and self.dialog.winfo_exists():
@@ -1777,33 +2037,55 @@ class App:
         top.after(300, lambda: top.iconphoto(False, self.icon))
         top.title("More settings")
         top.transient(self.root)
-        top.geometry("600x700")
+        top.geometry("600x720")
         top.minsize(540, 480)
         top.grid_columnconfigure(0, weight=1)
-        top.grid_rowconfigure(1, weight=1)
+        top.grid_rowconfigure(2, weight=1)
 
         head = ctk.CTkFrame(top, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=32, pady=(24, 8))
         ctk.CTkLabel(head, text="More settings", font=font(20, semi), text_color=TEXT, height=28).pack(anchor="w")
-        ctk.CTkLabel(head, text="Saved to isle_reconnect.json. They apply the next time you press Start.",
-                     font=font(13), text_color=MUTED, height=20).pack(anchor="w")
+        notes = {"Bot": "Saved to isle_reconnect.json. They apply the next time you press Start.",
+                 "Game": "Written to The Isle's own settings files. Close the game first; "
+                         "it picks them up on its next start."}
+        note = ctk.CTkLabel(head, text="", font=font(13), text_color=MUTED, height=20)
+        note.pack(anchor="w")
 
-        body = ctk.CTkScrollableFrame(top, fg_color="transparent", corner_radius=0,
-                                      scrollbar_button_color=RAISED, scrollbar_button_hover_color=CONTROL)
-        body.grid(row=1, column=0, sticky="nsew", padx=(24, 8))
-        body.grid_columnconfigure(0, weight=1)
-        rows = iter(range(1000))
+        def form():
+            body = ctk.CTkScrollableFrame(top, fg_color="transparent", corner_radius=0,
+                                          scrollbar_button_color=RAISED, scrollbar_button_hover_color=CONTROL)
+            body.grid_columnconfigure(0, weight=1)
+            return body, iter(range(1000))
 
-        def section(title, note):
-            ctk.CTkLabel(body, text=title, font=font(16, semi), text_color=TEXT, height=24, anchor="w").grid(
-                row=next(rows), column=0, sticky="w", padx=8, pady=(20, 0))
-            ctk.CTkLabel(body, text=note, font=font(13), text_color=MUTED, anchor="w", justify="left",
-                         wraplength=480).grid(row=next(rows), column=0, sticky="w", padx=8, pady=(2, 8))
+        pages = {"Bot": form(), "Game": form()}
 
-        def setting(text):
-            row = ctk.CTkFrame(body, fg_color="transparent")
-            row.grid(row=next(rows), column=0, sticky="ew", padx=8, pady=3)
+        def pick_page(name):
+            for n, (body, _) in pages.items():
+                if n == name:
+                    body.grid(row=2, column=0, sticky="nsew", padx=(24, 8))
+                else:
+                    body.grid_forget()
+            note.configure(text=notes[name])
+            show_tab(page_tabs, name)
+
+        tabs, page_tabs = self.underline_tabs(top, list(pages), pick_page)
+        tabs.grid(row=1, column=0, sticky="ew", padx=32, pady=(4, 0))
+
+        def place(page, widget, **grid):
+            widget.grid(row=next(page[1]), column=0, **grid)
+            return widget
+
+        def section(page, title, note):
+            place(page, ctk.CTkLabel(page[0], text=title, font=font(16, semi), text_color=TEXT, height=24,
+                                     anchor="w"), sticky="w", padx=8, pady=(20, 0))
+            place(page, ctk.CTkLabel(page[0], text=note, font=font(13), text_color=MUTED, anchor="w",
+                                     justify="left", wraplength=480), sticky="w", padx=8, pady=(2, 8))
+
+        def setting(page, text, hint=None):
+            row = place(page, ctk.CTkFrame(page[0], fg_color="transparent"), sticky="ew", padx=8, pady=3)
             ctk.CTkLabel(row, text=text, font=font(13), text_color=TEXT, height=34).pack(side="left")
+            if hint:
+                ctk.CTkLabel(row, text=hint, font=font(12), text_color=MUTED, height=34).pack(side="left", padx=(8, 0))
             return row
 
         def number(row, value, unit):
@@ -1814,22 +2096,31 @@ class App:
             entry.pack(side="right")
             return entry
 
-        section("Hotkeys", "Global keys that work while the game has focus.")
+        def switch(row, on):
+            var = ctk.BooleanVar(value=on)
+            ctk.CTkSwitch(row, text="", variable=var, width=34, switch_width=32, switch_height=16,
+                          progress_color=POSITIVE, fg_color=CONTROL, button_color=TEXT,
+                          button_hover_color="#e6e6e6").pack(side="right")
+            return var
+
+        bot = pages["Bot"]
+        section(bot, "Hotkeys", "Global keys that work while the game has focus.")
         keys = {}
         for action, text in (("quit", "Stop the bot"), ("pause", "Pause or resume")):
             keys[action] = ctk.StringVar(value=cfg["hotkeys"][action].upper())
-            ctk.CTkOptionMenu(setting(text), values=list(KEY_NAMES), variable=keys[action], width=120, height=34,
-                              corner_radius=6, font=font(13, mono), dropdown_font=font(13, mono),
+            ctk.CTkOptionMenu(setting(bot, text), values=list(KEY_NAMES), variable=keys[action], width=120,
+                              height=34, corner_radius=6, font=font(13, mono), dropdown_font=font(13, mono),
                               fg_color=RAISED, button_color=RAISED, button_hover_color=CONTROL, text_color=TEXT,
                               dropdown_fg_color=RAISED, dropdown_hover_color=CONTROL,
                               dropdown_text_color=TEXT).pack(side="right")
 
-        section("Timing", "How long the bot waits before it stops trusting the game's log.")
-        join_timeout = number(setting("Check the screen again after no join result for"), cfg["join_timeout"], "s")
-        launch_timeout = number(setting("Wait for a relaunched game for"), cfg["launch_timeout"], "s")
+        section(bot, "Timing", "How long the bot waits before it stops trusting the game's log.")
+        join_timeout = number(setting(bot, "Check the screen again after no join result for"),
+                              cfg["join_timeout"], "s")
+        launch_timeout = number(setting(bot, "Wait for a relaunched game for"), cfg["launch_timeout"], "s")
 
-        section("Screen reading", "Screenshots are enlarged before OCR. Larger reads the server list's small "
-                                  "font better, but each pass is slower.")
+        section(bot, "Screen reading", "Screenshots are enlarged before OCR. Larger reads the server list's small "
+                                       "font better, but each pass is slower.")
         scales = sorted(set(OCR_SCALES) | {float(cfg["ocr_scale"])})
         names = {f"{v:g}×": v for v in scales}
         scale = {"value": float(cfg["ocr_scale"])}
@@ -1838,33 +2129,172 @@ class App:
             scale["value"] = names[name]
             show_tab(scale_tabs, name)
 
-        tabs, scale_tabs = self.underline_tabs(body, list(names), pick_scale)
-        tabs.grid(row=next(rows), column=0, sticky="w", padx=8, pady=(0, 4))
+        tabs, scale_tabs = self.underline_tabs(bot[0], list(names), pick_scale)
+        place(bot, tabs, sticky="w", padx=8, pady=(0, 4))
         pick_scale(f"{scale['value']:g}×")
 
-        section("Button texts", "The bot finds buttons by their text. If the game renames one, add the new "
-                                "text here; separate several with commas. Yours are tried before the built-in ones.")
+        section(bot, "Button texts", "The bot finds buttons by their text. If the game renames one, add the new "
+                                     "text here; separate several with commas. Yours are tried before the "
+                                     "built-in ones.")
         texts = {}
         for key, name in LABEL_NAMES.items():
             built_in = DEFAULT_CONFIG["labels"][key]
             yours = [w for w in cfg["labels"].get(key, []) if w not in built_in]
-            ctk.CTkLabel(body, text=name, font=font(13), text_color=TEXT, height=20, anchor="w").grid(
-                row=next(rows), column=0, sticky="w", padx=8, pady=(8, 4))
-            texts[key] = ctk.CTkEntry(body, height=34, corner_radius=6, font=font(13), fg_color=RAISED,
+            place(bot, ctk.CTkLabel(bot[0], text=name, font=font(13), text_color=TEXT, height=20, anchor="w"),
+                  sticky="w", padx=8, pady=(8, 4))
+            texts[key] = ctk.CTkEntry(bot[0], height=34, corner_radius=6, font=font(13), fg_color=RAISED,
                                       border_width=1, border_color=CONTROL, text_color=TEXT,
                                       placeholder_text="none of your own", placeholder_text_color=MUTED)
             if yours:
                 texts[key].insert(0, ", ".join(yours))
-            texts[key].grid(row=next(rows), column=0, sticky="ew", padx=8)
-            ctk.CTkLabel(body, text="Built in: " + ", ".join(built_in), font=font(12), text_color=MUTED,
-                         anchor="w", justify="left", wraplength=480).grid(row=next(rows), column=0, sticky="w",
-                                                                          padx=8, pady=(4, 0))
-        ctk.CTkFrame(body, fg_color="transparent", height=16).grid(row=next(rows), column=0)
+            place(bot, texts[key], sticky="ew", padx=8)
+            place(bot, ctk.CTkLabel(bot[0], text="Built in: " + ", ".join(built_in), font=font(12),
+                                    text_color=MUTED, anchor="w", justify="left", wraplength=480),
+                  sticky="w", padx=8, pady=(4, 0))
+        place(bot, ctk.CTkFrame(bot[0], fg_color="transparent", height=16))
 
-        tk.Frame(top, height=1, bg=BORDER).grid(row=2, column=0, sticky="ew")
+        # The game's own settings. Each control remembers what the file held, so saving only rewrites
+        # the values you actually changed.
+        game, game_ini = pages["Game"], {}
+        quality, effects, tweaks, physics, choices, brightness, fps = {}, {}, {}, {}, [], {}, None
+        if not os.path.exists(GAME_SETTINGS):
+            section(game, "No game settings yet", "The Isle hasn't saved its settings on this PC. "
+                                                  "Start it once, close it, and come back here.")
+        else:
+            gus = game_ini["settings"] = GameIni(GAME_SETTINGS)
+            eng = game_ini["engine"] = GameIni(GAME_ENGINE)
+            levels = ["Low", "Medium", "High", "Epic"]
+            section(game, "Quality", "The same levels as the game's menu. Foliage and landscape cost the most "
+                                     "frames; textures cost almost none on a card with 8 GB.")
+            for key, name in GAME_QUALITY:
+                held = gus.get("ScalabilityGroups", key)
+                state = quality[key] = {"was": held, "value": held}
+
+                def pick_level(level, state=state):
+                    state["value"] = str(levels.index(level))
+                    show_tab(state["items"], level)
+
+                tabs, state["items"] = self.underline_tabs(setting(game, name), levels, pick_level)
+                tabs.pack(side="right")
+                # Unset, or a level the menu doesn't offer, shows no choice and is left as it is.
+                show_tab(state["items"], levels[int(held)] if held in ("0", "1", "2", "3") else None)
+            held = gus.get("/Script/Engine.GameUserSettings", "FrameRateLimit")
+            try:
+                held = float(held or 0)
+            except ValueError:
+                held = 0.0
+            fps = (held, number(setting(game, "Frame rate limit", "0 = none"), f"{held:g}", "fps"))
+
+            section(game, "Foliage", "Plants and grass that move cost CPU every frame, more so with players "
+                                     "around. Density can't be changed: the game resets it on every map load.")
+            for key, name, hint in FOLIAGE_PHYSICS:
+                held = gus.get("/Script/Engine.GameUserSettings", key)
+                physics[key] = (held, switch(setting(game, name, hint or None), held == "True"))
+
+            def choice(name, hint, presets):
+                """A row of Engine.ini presets; shows the one the file matches (none if set by hand)."""
+                keys = {key for preset in presets.values() for key in preset}
+                held = {key: eng.get(*key) for key in keys}
+                current = next((label for label, preset in presets.items()
+                                if all(held[key] == preset.get(key) for key in keys)), None)
+                state = {"was": current, "value": current, "presets": presets}
+
+                def pick(label):
+                    state["value"] = label
+                    show_tab(state["items"], label)
+
+                tabs, state["items"] = self.underline_tabs(setting(game, name, hint), list(presets), pick)
+                tabs.pack(side="right")
+                show_tab(state["items"], current)
+                choices.append(state)
+
+            section(game, "Fog", "Draws volumetric fog on a coarser grid: just as thick, cheaper, a little "
+                                 "blockier at the edges. Written to Engine.ini, untested. With Effects on Low the "
+                                 "game may skip this fog already.")
+            choice(*FOG_DETAIL)
+
+            section(game, "Visibility", "Servers ban for these: for private and sandbox servers only. All but "
+                                        "adaptive brightness go to Engine.ini, untested. Grass and foliage density "
+                                        "aren't here because the game resets them on every map load. Adaptive "
+                                        "brightness raises the screen's gamma in dark scenes while the game is in "
+                                        "front, and works as soon as you save.")
+            for name, hint, presets in VISIBILITY_CHOICES:
+                choice(name, hint, presets)
+
+            def pick_brightness(level):
+                brightness["value"] = level
+                show_tab(brightness["items"], level)
+
+            brightness["value"] = cfg["adaptive_brightness"]
+            tabs, brightness["items"] = self.underline_tabs(setting(game, "Adaptive brightness", "live"),
+                                                            list(BRIGHTNESS_LEVELS), pick_brightness)
+            tabs.pack(side="right")
+            show_tab(brightness["items"], brightness["value"])
+            for key, value, name, hint in VISIBILITY_TWEAKS:
+                held = eng.get(SYSTEM, key)
+                tweaks[key] = (value, held, switch(setting(game, name, hint), held == value))
+
+            section(game, "Hidden effects", "The game reads these from its settings file, but its menu doesn't "
+                                            "show them. Turning one off saves a little GPU time.")
+            for key, name, hint in HIDDEN_EFFECTS:
+                held = gus.get("/Script/Engine.RendererSettings", key)
+                effects[key] = (held, switch(setting(game, name, hint), held != "0"))
+
+            section(game, "Engine tweaks", "Written to Engine.ini. Untested on this build of the game, which may "
+                                           "ignore them.")
+            for key, value, name, hint in ENGINE_TWEAKS:
+                held = eng.get(SYSTEM, key)
+                tweaks[key] = (value, held, switch(setting(game, name, hint), held == value))
+            place(game, ctk.CTkLabel(game[0], text="The first change keeps a copy of each file next to it, "
+                                                   "ending in .bak.", font=font(12), text_color=MUTED, anchor="w",
+                                     justify="left", wraplength=480), sticky="w", padx=8, pady=(16, 0))
+        place(game, ctk.CTkFrame(game[0], fg_color="transparent", height=16))
+        pick_page("Bot")
+
+        tk.Frame(top, height=1, bg=BORDER).grid(row=3, column=0, sticky="ew")
         foot = ctk.CTkFrame(top, fg_color="transparent")
-        foot.grid(row=3, column=0, sticky="ew", padx=32, pady=16)
+        foot.grid(row=4, column=0, sticky="ew", padx=32, pady=16)
         self.text_button(foot, "Open config file", self.edit_config).pack(side="left")
+
+        def game_changes():
+            """Applies the Game tab to the ini files in memory. Returns an error, or None."""
+            if not game_ini:
+                return None
+            gus, eng = game_ini["settings"], game_ini["engine"]
+            for key, state in quality.items():
+                if state["value"] != state["was"]:
+                    gus.set("ScalabilityGroups", key, state["value"])
+            try:
+                limit = float(fps[1].get() or 0)
+            except ValueError:
+                return "The frame rate limit is a number (0 for none)."
+            if not 0 <= limit <= 1000:
+                return "The frame rate limit runs from 0 (none) to 1000."
+            if abs(limit - fps[0]) > 1e-6:
+                gus.set("/Script/Engine.GameUserSettings", "FrameRateLimit", f"{limit:.6f}")
+            for key, (held, var) in effects.items():
+                if var.get() and held == "0":
+                    gus.set("/Script/Engine.RendererSettings", key, None)  # back to the game's own value
+                elif not var.get() and held != "0":
+                    gus.set("/Script/Engine.RendererSettings", key, "0")
+            for key, (held, var) in physics.items():
+                if var.get() != (held == "True"):
+                    gus.set("/Script/Engine.GameUserSettings", key, "True" if var.get() else "False")
+            for state in choices:
+                if state["value"] != state["was"]:
+                    preset = state["presets"][state["value"]]
+                    for key in {key for p in state["presets"].values() for key in p}:
+                        eng.set(*key, preset.get(key))
+            for key, (value, held, var) in tweaks.items():
+                if var.get() and held != value:
+                    eng.set(SYSTEM, key, value)
+                elif not var.get() and held == value:
+                    eng.set(SYSTEM, key, None)
+            if any(ini.changed() for ini in game_ini.values()) and game_process_running():
+                for ini in game_ini.values():
+                    ini.lines = list(ini.original)
+                return "Close The Isle first: it rewrites its settings files when it exits."
+            return None
 
         def save():
             if keys["quit"].get() == keys["pause"].get():
@@ -1875,10 +2305,23 @@ class App:
                 return error.configure(text="Waits are whole seconds.")
             if not (10 <= waits[0] <= 3600 and 30 <= waits[1] <= 3600):
                 return error.configure(text="Waits run from 10 s (30 s for a relaunch) to 3600 s.")
+            problem = game_changes()
+            if problem:
+                pick_page("Game")
+                return error.configure(text=problem)
+            try:
+                written = [os.path.basename(ini.path) for ini in game_ini.values() if ini.save()]
+            except OSError as e:
+                return error.configure(text=f"Couldn't write the game's settings: {e.strerror}")
+            if written:
+                log("Game settings written to " + " and ".join(written) + ". They apply when The Isle starts.")
             cfg = load_config(None)  # fresh, so nothing the main window saved since is lost
             cfg["hotkeys"] = {action: var.get() for action, var in keys.items()}
             cfg["join_timeout"], cfg["launch_timeout"] = waits
             cfg["ocr_scale"] = scale["value"]
+            if brightness:
+                cfg["adaptive_brightness"] = brightness["value"]
+                self.brightness.set_level(brightness["value"])
             for key, entry in texts.items():
                 words = [w.strip() for w in entry.get().split(",") if w.strip()]
                 seen = {w.upper() for w in words}
@@ -1906,6 +2349,7 @@ class App:
         self.view.configure(state="disabled")
 
     def close(self):
+        self.brightness.stop()  # your own screen gamma back
         if self.running():
             self.bot.stop()
             self.thread.join(2)
@@ -2135,7 +2579,9 @@ def main():
     r.add_argument("--debug", action="store_true", help="print what OCR reads each pass")
     sub.add_parser("scan", help="OCR the game window once and print the text found")
     sub.add_parser("status", help="show the game state from the log")
-    sub.add_parser("stats", help="read hunger and thirst from the HUD once")
+    st = sub.add_parser("stats", help="read hunger and thirst from the HUD once")
+    st.add_argument("--exact", action="store_true",
+                    help="also read the game's exact tooltip values to check the estimate (opens chat)")
     sub.add_parser("stop", help="stop a running bot (no hotkey needed)")
     args = p.parse_args()
     commands = {"run": cmd_run, "scan": cmd_scan, "status": cmd_status, "stop": cmd_stop, "stats": cmd_stats,

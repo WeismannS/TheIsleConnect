@@ -60,6 +60,18 @@ A dark monitor built with [customtkinter](https://github.com/TomSchimansky/Custo
 
 **More settings** (in the Settings card) covers the rest of the config without editing the file: the hotkeys, the two timeouts, how much screenshots are enlarged for OCR, and extra button texts to look for if the game renames a button.
 
+Its **Game** tab edits The Isle's own settings files in `%LOCALAPPDATA%\TheIsle\Saved\Config\WindowsClient`:
+
+- **Quality**: the game's graphics levels (view distance, shadows, textures, effects, foliage, shading, landscape) and its frame rate limit.
+- **Foliage**: the game's foliage physics switches (plants moving for you or for everyone, grass bending). All three cost CPU.
+- **Fog**: fog detail (Game / Lower / Lowest) draws volumetric fog on a coarser grid. It stays just as thick but costs less. Written to `Engine.ini`, untested.
+- **Visibility** (for private and sandbox servers; public servers ban for these): night brightness (display gamma), draw distance, and switches for height fog, volumetric fog and clouds. Written to `Engine.ini`, untested.
+- **Adaptive brightness** (Off / Low / Medium / High): while the game is the active window, the app measures how dark the middle of the picture is about twice a second. In dark scenes it raises the screen's gamma, easing back as it gets lighter. Switching away from the game or turning it Off restores your normal gamma at once. It works live, even with the game open. It changes the display's gamma ramp, so it brightens everything on that monitor while active, and it overrides tools like f.lux or Night light while it runs. If the app is killed while it's boosting, the next start restores your gamma from `isle_reconnect_gamma.bin`.
+- **Hidden effects**: bloom and lens flare. The game reads both from `GameUserSettings.ini`, but its menu doesn't show them.
+- **Engine tweaks**: ambient occlusion, depth of field, chromatic aberration and film grain off, and sharpening, written to `Engine.ini` under `[SystemSettings]`. These haven't been tested on the current build, which may ignore them.
+
+Close the game before saving: it rewrites these files when it exits, so the tab refuses to save while the game runs. Only the values you change are written. The first change keeps the original file next to it as `.bak`. Grass and foliage density aren't offered: the game resets them on every map load.
+
 To build the exe yourself: `pip install pyinstaller` then `pyinstaller --onefile --collect-data customtkinter --exclude-module PIL --exclude-module numpy isle_reconnect.py` (the two excludes keep out optional libraries the app never uses, about 17 MB). Double-clicking it opens the window without a console; run from a terminal, it takes the commands below.
 
 ## Recovering on its own
@@ -70,13 +82,13 @@ Besides retrying joins and rejoining after disconnects, the bot gets itself out 
 - **The game's log and the screen disagree.** If the log never says the menu loaded (60 s), or says you're in game while the HUD has been gone for 2 minutes, the bot checks the screen and goes by what it sees. An unlogged disconnect is treated as a disconnect.
 - **An unrecognised screen** in the menus: after 45 s it presses Esc once (for a stray popup); after 3 minutes it closes the game so it's relaunched. A game that's still starting gets `launch_timeout` + 3 minutes.
 - **A frozen game** (Windows says *Not Responding*) for 5 minutes is closed and relaunched.
-- **Pause menu or chat in the way** while safe-log is on: the pause menu is closed (it blurs the HUD and swallows keys), and before a safe-log chat is cleared and closed, so H goes to the dino and not into chat.
+- **Pause menu or chat in the way** while safe-log is on: the pause menu is closed (it blurs the HUD and swallows keys), and before a safe-log chat is cleared and closed, so H goes to the dino and not into chat. Both use keys posted to the game window, so they work in the background too.
 
 ## Auto safe-log
 
-The bot can safe-log you when your dino gets hungry or thirsty. When hunger or thirst drops to the level you set, it rests (H), holds H to sleep, waits for the server to let you out (60 s), and then pauses instead of rejoining.
+The bot can safe-log you when your dino gets hungry or thirsty. When hunger or thirst drops to the level you set, it rests (H), holds H to sleep, waits for the server to let you out (60 s), and then pauses instead of rejoining. The H presses go to the game window only, so they work while you're tabbed out and can't type into another app.
 
-It watches the stomach and water-drop icons at the bottom right of the HUD every 5 s. That estimate can be a few points off, so once a stat gets within 5 points of its level, the bot checks the exact value: it opens chat (Enter) to free the cursor, hovers the icon, reads the game's tooltip (e.g. `16.63 %`), and closes chat (Enter again). It does this at most every 30 s and only safe-logs on the exact value. A solid red icon means the stat is empty, so that counts as 0% without opening chat. For the tooltip check the game window must be visible on screen.
+It reads the stomach and water-drop icons at the bottom right of the HUD every 5 s. The reading is calibrated against the game's own values and lands within about 1 point at 1920×1080. All of this works with the game in the background: the bot never brings it to the front, moves your mouse or opens chat while you play.
 
 Set the levels in the window's Settings card (**Auto safe-log at**), or in `isle_reconnect.json`. While the bot runs, the card shows what it last read next to each level.
 
@@ -88,7 +100,7 @@ Set the levels in the window's Settings card (**Auto safe-log at**), or in `isle
 
 - After a safe-log, a stat must be seen above its level again before it can trigger, so rejoining while still hungry doesn't log you straight back out.
 - An empty stat (the icon turns solid red) reads as 0%.
-- If the tooltip can't be read, it falls back on the icon and waits for three low readings in a row (about 15 s), so one bad frame can't log you out.
+- It waits for three low readings in a row (about 15 s), so one bad frame can't log you out. A solid red icon means the stat is empty and safe-logs at once.
 - If you're still in game 90 s after a safe-log, it tries again, up to 3 times, then pauses.
 - Keep the HUD visible. While the icons are hidden (map, menus) the bot just skips the check.
 
@@ -112,7 +124,7 @@ Change them under `hotkeys` in `isle_reconnect.json` (any of F1-F24, PAUSE, SCRO
 | `run --exit-on-join` | Stop once you're in |
 | `run --rejoin-after-leave` | Rejoin even when you leave or safe-log yourself (saved) |
 | `run --debug` | Print what OCR reads on each pass |
-| `stats` | Read hunger and thirst once, from the icons and the exact tooltips (opens chat for a moment) |
+| `stats [--exact]` | Read hunger and thirst once from the HUD. `--exact` also reads the game's tooltips to check the estimate (brings the game to the front and opens chat) |
 | `stop` | Stop a running bot without the hotkey |
 | `scan` | OCR the game window once and print the text it finds |
 | `status` | Show what the log says the game is doing |
