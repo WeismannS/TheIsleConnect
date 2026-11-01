@@ -58,7 +58,39 @@ The server name is saved to `isle_reconnect.json`, so after the first run `pytho
 
 A dark monitor built with [customtkinter](https://github.com/TomSchimansky/CustomTkinter): what the bot is doing and since when, attempt / join counters, a strip of every join attempt in the last 30 minutes (hover a tick for its time and result), and the activity log. Type part of the server's name, pick the session filter, and press **Start**. **Pause** / **Stop** do the same as the hotkeys, **Scan screen** prints what OCR sees (handy when the bot can't find something), and **Config file** (top right) opens `isle_reconnect.json` in Notepad. The settings are saved when you press Start.
 
+**More settings** (in the Settings card) covers the rest of the config without editing the file: the hotkeys, the two timeouts, how much screenshots are enlarged for OCR, and extra button texts to look for if the game renames a button.
+
 To build the exe yourself: `pip install pyinstaller` then `pyinstaller --onefile --collect-data customtkinter --exclude-module PIL --exclude-module numpy isle_reconnect.py` (the two excludes keep out optional libraries the app never uses, about 17 MB). Double-clicking it opens the window without a console; run from a terminal, it takes the commands below.
+
+## Recovering on its own
+
+Besides retrying joins and rejoining after disconnects, the bot gets itself out of these:
+
+- **An unexpected error** is logged and the bot carries on after a short wait (2 s, doubling up to 60 s), so it never stops while you're away.
+- **The game's log and the screen disagree.** If the log never says the menu loaded (60 s), or says you're in game while the HUD has been gone for 2 minutes, the bot checks the screen and goes by what it sees. An unlogged disconnect is treated as a disconnect.
+- **An unrecognised screen** in the menus: after 45 s it presses Esc once (for a stray popup); after 3 minutes it closes the game so it's relaunched. A game that's still starting gets `launch_timeout` + 3 minutes.
+- **A frozen game** (Windows says *Not Responding*) for 5 minutes is closed and relaunched.
+- **Pause menu or chat in the way** while safe-log is on: the pause menu is closed (it blurs the HUD and swallows keys), and before a safe-log chat is cleared and closed, so H goes to the dino and not into chat.
+
+## Auto safe-log
+
+The bot can safe-log you when your dino gets hungry or thirsty. When hunger or thirst drops to the level you set, it rests (H), holds H to sleep, waits for the server to let you out (60 s), and then pauses instead of rejoining.
+
+It watches the stomach and water-drop icons at the bottom right of the HUD every 5 s. That estimate can be a few points off, so once a stat gets within 5 points of its level, the bot checks the exact value: it opens chat (Enter) to free the cursor, hovers the icon, reads the game's tooltip (e.g. `16.63 %`), and closes chat (Enter again). It does this at most every 30 s and only safe-logs on the exact value. A solid red icon means the stat is empty, so that counts as 0% without opening chat. For the tooltip check the game window must be visible on screen.
+
+Set the levels in the window's Settings card (**Auto safe-log at**), or in `isle_reconnect.json`. While the bot runs, the card shows what it last read next to each level.
+
+```json
+"safe_log": {"hunger": 20, "thirst": 20, "key": "H", "hold_seconds": 2.0}
+```
+
+`0` turns a stat off (the default). Run `python isle_reconnect.py stats` in game to check what the bot reads.
+
+- After a safe-log, a stat must be seen above its level again before it can trigger, so rejoining while still hungry doesn't log you straight back out.
+- An empty stat (the icon turns solid red) reads as 0%.
+- If the tooltip can't be read, it falls back on the icon and waits for three low readings in a row (about 15 s), so one bad frame can't log you out.
+- If you're still in game 90 s after a safe-log, it tries again, up to 3 times, then pauses.
+- Keep the HUD visible. While the icons are hidden (map, menus) the bot just skips the check.
 
 ## Hotkeys
 
@@ -80,6 +112,7 @@ Change them under `hotkeys` in `isle_reconnect.json` (any of F1-F24, PAUSE, SCRO
 | `run --exit-on-join` | Stop once you're in |
 | `run --rejoin-after-leave` | Rejoin even when you leave or safe-log yourself (saved) |
 | `run --debug` | Print what OCR reads on each pass |
+| `stats` | Read hunger and thirst once, from the icons and the exact tooltips (opens chat for a moment) |
 | `stop` | Stop a running bot without the hotkey |
 | `scan` | OCR the game window once and print the text it finds |
 | `status` | Show what the log says the game is doing |
@@ -102,6 +135,7 @@ Change them under `hotkeys` in `isle_reconnect.json` (any of F1-F24, PAUSE, SCRO
 | `launch_timeout` | Seconds to wait for a relaunched game |
 | `rejoin_after_leave` | Rejoin even when you leave the server yourself |
 | `relaunch_after_quit` | Relaunch the game through Steam if it closes |
+| `safe_log` | Hunger / thirst levels (%) that trigger a safe-log (`0` = off), the rest key, and how long to hold it |
 
 ## Tips
 

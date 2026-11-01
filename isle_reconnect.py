@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
         "search": ["SERVER NAME FILTER", "SEARCH", "SEARCH SERVERS"],
         "refresh": ["REFRESH"],
         "browser": ["SESSION FILTER", "REFRESH", "SERVER NAME FILTER"],  # proves we're in the server list
+        "resume": ["RESUME"],  # the in-game pause menu (Esc)
         "to_browser": ["PLAY", "SERVER BROWSER", "SERVERS", "BROWSE SERVERS", "MULTIPLAYER",
                        "FIND SERVER", "COMMUNITY"],
     },
@@ -76,6 +77,9 @@ DEFAULT_CONFIG = {
     "launch_timeout": 240,    # seconds to wait for a relaunched game
     "rejoin_after_leave": False,
     "relaunch_after_quit": False,
+    # Safe-log when hunger or thirst (read from the HUD) drops to this many percent; 0 turns it off.
+    # Safe-logging taps the key to rest, then holds it to sleep; the server lets you out after 60 s.
+    "safe_log": {"hunger": 0, "thirst": 0, "key": "H", "hold_seconds": 2.0},
 }
 
 VK_RETURN = 0x0D
@@ -125,6 +129,8 @@ kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
                                                 wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+user32.IsHungAppWindow.argtypes = [wintypes.HWND]
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -274,6 +280,47 @@ class Game:
             _send(_mouse(0x0002), _mouse(0x0004))  # left down, left up
             time.sleep(0.05)
 
+    def move(self, x, y):
+        """Moves the mouse as real movement (SendInput), which the game's hover needs;
+        SetCursorPos alone doesn't bring up its tooltips."""
+        sx, sy = self.to_screen(x, y)
+        sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+        _send(INPUT(type=0, u=_INPUTUNION(mi=MOUSEINPUT(int(sx * 65535 / (sw - 1)), int(sy * 65535 / (sh - 1)),
+                                                         0, 0x8001, 0, 0))))  # MOVE | ABSOLUTE
+
+    def tap(self, vk):
+        scan = user32.MapVirtualKeyW(vk, 0)
+        _send(_key(scan=scan, flags=0x8))
+        time.sleep(0.05)
+        _send(_key(scan=scan, flags=0x8 | 2))
+
+    def clear_line(self):
+        """Empties the text box that has focus (Ctrl+A, Backspace)."""
+        _send(_key(0x11), _key(0x41), _key(0x41, flags=2), _key(0x11, flags=2))
+        time.sleep(0.03)
+        self.tap(0x08)
+
+    def hung(self):
+        return bool(user32.IsHungAppWindow(self.hwnd))
+
+    def kill(self):
+        """Ends a game that's frozen or stuck; the bot then relaunches it through Steam."""
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(self.hwnd, ctypes.byref(pid))
+        h = kernel32.OpenProcess(0x0001, False, pid.value)  # PROCESS_TERMINATE
+        if h:
+            kernel32.TerminateProcess(h, 1)
+            kernel32.CloseHandle(h)
+        self.hwnd = None
+
+    def hold_key(self, key, seconds):
+        """Holds a letter key down for `seconds`. Sent as a scan code: games read those, not virtual keys."""
+        self.focus()
+        scan = user32.MapVirtualKeyW(ord(key.upper()), 0)
+        _send(_key(scan=scan, flags=0x8))  # KEYEVENTF_SCANCODE
+        time.sleep(seconds)
+        _send(_key(scan=scan, flags=0x8 | 2))  # | KEYEVENTF_KEYUP
+
     def type_text(self, text):
         self.focus()
         _send(_key(0x11), _key(0x41), _key(0x41, flags=2), _key(0x11, flags=2))  # Ctrl+A
@@ -367,6 +414,116 @@ kernel32.OpenEventW.restype = wintypes.HANDLE
 kernel32.SetEvent.argtypes = [wintypes.HANDLE]
 kernel32.ResetEvent.argtypes = [wintypes.HANDLE]
 kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+
+
+# --- Hunger / thirst ---------------------------------------------------------
+
+# The HUD's stomach and water-drop icons (bottom right) fill with pale cyan from the bottom up.
+# The band each fill moves in, as (left, top, right, bottom) pixels in from the window's
+# bottom-right corner at 1080p; the HUD scales with the window height.
+STAT_ICONS = {"hunger": (163, 232, 86, 173), "thirst": (114, 163, 54, 99)}
+
+
+def read_stats(game):
+    """{"hunger": %, "thirst": %} from the HUD; None for an icon that isn't on screen
+    (menus, the map, a hidden HUD). At 0 the game draws the icon solid red instead."""
+    w, h, data, _ = game.capture()
+    k = h / 1080
+    stats = {}
+    for stat, (left, top, right, bottom) in STAT_ICONS.items():
+        x0, x1 = w - round(left * k), w - round(right * k)
+        top, bottom = h - round(top * k), h - round(bottom * k)
+        drawn, fill_top, gap, red = 0, None, 0, 0
+        for y in range(bottom, top - 1, -1):  # bottom up, to the top of the fill
+            row = data[(y * w + x0) * 4:(y * w + x1) * 4]
+            cyan = fill = 0
+            for i in range(0, len(row), 4):
+                b, g, r = row[i], row[i + 1], row[i + 2]
+                cyan += g > 170 and b > 170 and b > r + 20  # the glowing outline, or the fill
+                fill += g > 200 and b > 200 and r > 150 and b > r + 10  # the pale fill
+                red += r >= 230 and g < 70 and b < 70  # empty: the icon turns red
+            drawn += cyan >= 3
+            if gap <= 3 * k and fill >= 4 * k and fill >= 0.35 * cyan:
+                fill_top, gap = y, 0
+            elif fill_top is not None:
+                gap += 1  # a few rows of slack for the icon's ragged edge; then the fill is over
+        if red > 0.15 * (x1 - x0) * (bottom - top + 1):
+            stats[stat] = 0
+        elif drawn < 0.6 * (bottom - top + 1):
+            stats[stat] = None
+        elif fill_top is None:
+            stats[stat] = 0
+        else:
+            stats[stat] = min(100, round(100 * (bottom - fill_top + 1) / (bottom - top + 1)))
+    return stats
+
+
+RE_PERCENT = re.compile(r"(\d{1,3}[.,]\d{1,2})")
+
+
+def crop(image, x0, y0, w, h, factor):
+    """A piece of a capture, enlarged by factor (nearest neighbour), as an image for Ocr.read."""
+    iw, ih, data, _ = image
+    x0, y0 = max(0, min(x0, iw - w)), max(0, min(y0, ih - h))
+    out = bytearray()
+    for y in range(h * factor):
+        row = data[((y0 + y // factor) * iw + x0) * 4:((y0 + y // factor) * iw + x0 + w) * 4]
+        line = b"".join(row[i:i + 4] * factor for i in range(0, len(row), 4))
+        out += line
+    return w * factor, h * factor, bytes(out), factor
+
+
+def chat_open(image):
+    """Whether chat is taking input: its white typing bar, along the bottom left, is showing."""
+    w, h, data, scale = image
+    k = h / 1080
+    y = h - round(16 * k)
+    row = [data[(y * w + round(x * k)) * 4:(y * w + round(x * k)) * 4 + 3] for x in range(100, 600, 25)]
+    return min(sum(px) / 3 for px in row) > 150
+
+
+def read_exact(game, ocr, stats):
+    """Exact values from the game's own tooltips: open chat (Enter) to free the cursor, hover each
+    icon, OCR the "16.63 %" that appears up and to the right of it, close chat (Enter again; Esc
+    would open the pause menu). The tooltip is its own window, so this captures the screen; the
+    game must be visible. Returns {stat: percent} for the ones it could read."""
+    w, h = game.client_size()
+    k = h / 1080
+    found = {}
+    use_screen, game.use_screen = game.use_screen, True
+    try:
+        game.focus()
+        if chat_open(game.capture()):
+            game.clear_line()  # already open: empty it, so closing it below sends nothing
+        else:
+            game.tap(VK_RETURN)
+            time.sleep(0.8)
+            if not chat_open(game.capture()):
+                log("Couldn't open chat to read the exact hunger / thirst - using the HUD icons")
+                return found
+        try:
+            for stat in stats:
+                left, top, right, bottom = STAT_ICONS[stat]
+                x, y = w - (left + right) / 2 * k, h - (top + bottom) / 2 * k
+                for d in (-20, -10, -4, 0, 2, 0):  # a little real movement, so the game registers the hover
+                    game.move(x + d, y + d)
+                    time.sleep(0.08)
+                for _ in range(4):  # the tooltip takes a moment to appear
+                    time.sleep(0.6)
+                    image = game.capture(2.0)
+                    piece = crop(image, int(2 * x), int(2 * (y - 45 * k)), int(2 * 150 * k), int(2 * 55 * k), 2)
+                    m = RE_PERCENT.search(" ".join(line.text for line in ocr.read(piece)))
+                    if m and 0 <= float(m.group(1).replace(",", ".")) <= 100:
+                        found[stat] = float(m.group(1).replace(",", "."))
+                        break
+        finally:
+            game.tap(VK_RETURN)  # closes chat; it's empty, so nothing is sent
+            time.sleep(0.5)
+            if chat_open(game.capture()):
+                game.tap(VK_RETURN)
+    finally:
+        game.use_screen = use_screen
+    return found
 
 
 # --- OCR ---------------------------------------------------------------------
@@ -671,6 +828,7 @@ class Navigator:
         self.refresh_at = 0.0
         self.last_seen = time.time()
         self.warned = False
+        self.esc_sent = False  # the bot's one Esc when the screen is unrecognisable
         self.last_action = None
 
     def act(self, what):
@@ -794,7 +952,7 @@ class Navigator:
         self._seen()
 
     def _seen(self):
-        self.last_seen, self.warned = time.time(), False
+        self.last_seen, self.warned, self.esc_sent = time.time(), False, False
 
 
 # --- Commands ----------------------------------------------------------------
@@ -805,7 +963,11 @@ def load_config(args):
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, encoding="utf-8") as f:
             saved = json.load(f)
-        cfg.update({k: v for k, v in saved.items() if k != "labels"})
+        for k, v in saved.items():
+            if isinstance(cfg.get(k), dict) and k != "labels":  # yours over the defaults, key by key
+                cfg[k] = {**cfg[k], **v}
+            elif k != "labels":
+                cfg[k] = v
         for key, words in saved.get("labels", {}).items():  # your labels first, then any new defaults
             cfg["labels"][key] = words + [w for w in cfg["labels"].get(key, []) if w not in words]
     if getattr(args, "server", None):
@@ -827,19 +989,31 @@ def cmd_status(args):
     print(f"Game running: {running}\nLog state:    {gl.state}\nLast server:  {gl.server_ip}")
 
 
-def scan():
-    """OCR the game window once; returns the report as lines of text."""
+def scan(ocr_scale):
+    """OCR the game window once, enlarged like the bot does; returns the report as lines of text."""
     game = Game()
     if not game.find():
         sys.exit("Game window not found.")
-    image = game.capture(DEFAULT_CONFIG["ocr_scale"])
+    image = game.capture(ocr_scale)
     lines = Ocr().read(image)
     return [f"{game.client_size()}, {len(lines)} text lines:"] + [
         f"  ({line.center[0]:5.0f},{line.center[1]:5.0f})  {line.text}" for line in lines]
 
 
 def cmd_scan(args):
-    print("\n".join(scan()))
+    print("\n".join(scan(load_config(args)["ocr_scale"])))
+
+
+def cmd_stats(args):
+    game = Game()
+    if not game.find():
+        sys.exit("Game window not found.")
+    estimate = read_stats(game)
+    print("Opening chat to read the exact values from the tooltips...")
+    exact = read_exact(game, Ocr(), list(STAT_ICONS))
+    for stat, value in estimate.items():
+        shown = "icon not on screen" if value is None else f"~{value}% from the icon"
+        print(f"{stat.capitalize():7} {shown}, " + (f"{exact[stat]:g}% exact" if stat in exact else "tooltip not read"))
 
 
 def cmd_stop(args):
@@ -866,6 +1040,10 @@ class Bot:
         self.game_running = None  # unknown until the first check
         self.started_at = self.ended_at = None
         self.events = collections.deque(maxlen=5000)  # (time, kind) for the GUI's attempt strip
+        self.stats, self.stats_at = {}, 0.0  # last hunger / thirst reading
+        self.exact_at, self.exact_ok = 0.0, {}  # last tooltip check; when each stat last read exactly
+        self.armed, self.low = set(STAT_ICONS), {}  # see _watch_stats
+        self.safe_log_started, self.safe_log_tries = None, 0
         self._stop = threading.Event()
         self._toggle = threading.Event()
         self._wake = threading.Event()  # cuts a sleep short so the buttons respond at once
@@ -906,19 +1084,21 @@ class Bot:
 
     def _loop(self, keys, stop_event):
         cfg = self.cfg
-        game, ocr, gl = Game(), Ocr(), GameLog(self.log_path)
-        nav = Navigator(cfg, game, ocr, debug=self.debug)
+        self.game, self.ocr, self.gl = Game(), Ocr(), GameLog(self.log_path)
+        self.nav = Navigator(cfg, self.game, self.ocr, debug=self.debug)
         hk = cfg["hotkeys"]
         self.started_at = time.time()
-        join_started, launched_at, last_seen_game = None, 0.0, time.time()
+        self.join_started, self.launched_at, self.last_seen_game = None, 0.0, time.time()
+        self.hud_seen_at, self.hud_checked_at, self.overlay_at, self.hung_since = time.time(), 0.0, 0.0, None
         log(f"Bot running for '{cfg['server']}'. {hk['quit']} quit, {hk['pause']} pause "
             f"(or: python isle_reconnect.py stop).")
-        if gl.state == "ingame":
+        if self.gl.state == "ingame":
             self.events.append((time.time(), "ingame"))
             log("Already in game - standing by, will rejoin if you get disconnected.")
 
+        errors = 0
         while True:
-            self.state, self.since, self.server_ip = gl.state, gl.since, gl.server_ip
+            self.state, self.since, self.server_ip = self.gl.state, self.gl.since, self.gl.server_ip
             if keys.take("quit"):
                 log(f"Stopped ({hk['quit']} pressed).")
                 return
@@ -932,65 +1112,240 @@ class Bot:
                 self._toggle.clear()
                 self.paused = not self.paused
                 log("Paused." if self.paused else "Resumed.")
+                self.nav.reset()
+            try:
+                if self._step():
+                    return
+                errors = 0
+            except Exception as e:  # one bad pass mustn't end the bot; back off and carry on
+                errors += 1
+                wait = min(60, 2 ** errors)
+                log(f"Error: {e!r} - carrying on in {wait} s")
+                self.nav.reset()
+                self._sleep(wait)
+
+    def _step(self):
+        """One pass of the loop. Returns True when the bot should stop."""
+        cfg, game, gl, nav = self.cfg, self.game, self.gl, self.nav
+        for ev in gl.poll():
+            if self._on_event(ev):
+                return True
+
+        if self.paused:
+            self._sleep(0.1)
+            return False
+
+        now = time.time()
+        self.game_running = bool(game.find())
+        if not self.game_running:
+            if now - self.last_seen_game > 5 and now - self.launched_at > cfg["launch_timeout"]:
+                log("Game is not running - launching it through Steam")
+                os.startfile(STEAM_LAUNCH)
+                self.launched_at = now
                 nav.reset()
+            self._sleep(1)
+            return False
+        self.last_seen_game = now
 
-            for ev in gl.poll():
-                self.events.append((time.time(), ev))
-                if ev == "joining":
-                    self.attempts += 1
-                    join_started = time.time()
-                    log(f"Attempt #{self.attempts}: connecting to {gl.server_ip}...")
-                elif ev == "join_failed":
-                    took = time.time() - join_started if join_started else 0
-                    log(f"Attempt #{self.attempts} rejected after {took:.1f}s (server full?) - retrying")
-                elif ev == "ingame":
-                    log(f"IN GAME after {self.attempts} attempt(s).")
-                    self.joins += 1
-                    if self.exit_on_join:
-                        return
-                    self.attempts = 0
-                elif ev == "disconnected":
-                    log("Disconnected from the server - rejoining")
-                elif ev == "left":
-                    if cfg["rejoin_after_leave"]:
-                        log("Left the server - rejoining")
-                    else:
-                        self.paused = True
-                        log(f"You left the server yourself - paused ({hk['pause']} to rejoin).")
-                elif ev == "closed":
-                    if not cfg["relaunch_after_quit"]:
-                        self.paused = True
-                        log(f"Game was closed normally - paused ({hk['pause']} to relaunch and rejoin).")
-                elif ev == "menu":
-                    nav.reset()
+        if game.hung():  # "Not Responding": nothing on screen will change, so restart it
+            self.hung_since = self.hung_since or now
+            if now - self.hung_since > 300:  # map loads can freeze the window for a while
+                log("Game has been frozen (Not Responding) for 5 min - closing it so it can be relaunched")
+                game.kill()
+                self.hung_since = None
+            self._sleep(1)
+            return False
+        self.hung_since = None
 
-            if self.paused:
-                self._sleep(0.1)
-                continue
+        if gl.state == "ingame":
+            self._check_ingame(now)
+        if gl.state == "ingame":
+            self._watch_stats(game, now)
+        if gl.state == "joining" and now - gl.since > cfg["join_timeout"]:
+            log("No join result for a while - checking the screen")
+            gl._set("menu")
+        if gl.state == "loading" and now - gl.since > 60:  # the log never said the menu loaded
+            where = self._where()
+            log("Stuck loading according to the game's log - the screen shows "
+                + {"ingame": "you in game", "menu": "the menu"}.get(where, "nothing recognisable"))
+            gl._set("ingame" if where == "ingame" else "menu")
+            self.hud_seen_at = now
+        if gl.state == "menu" or (gl.state == "starting" and now - gl.since > 20):
+            try:
+                nav.tick()
+            except OSError as e:
+                log(f"Capture/OCR hiccup: {e}")
+            # Escalate when nothing on screen is recognised: Esc for a stray popup or overlay,
+            # then restart the game. A starting game can sit on loading screens, so wait longer.
+            idle = now - max(nav.last_seen, gl.since)
+            if gl.state == "menu" and idle > 45 and not nav.esc_sent:
+                log("Still nothing recognisable - pressing Esc in case a popup is in the way")
+                game.focus()
+                game.tap(0x1B)
+                nav.esc_sent = True
+            if idle > (180 if gl.state == "menu" else cfg["launch_timeout"] + 180):
+                log(f"Stuck on an unrecognised screen for {idle / 60:.0f} min - restarting the game")
+                game.kill()
+                nav.reset()
+            self._sleep(0.05)
+        else:
+            self._sleep(0.1)
+        return False
 
-            now = time.time()
-            self.game_running = bool(game.find())
-            if not self.game_running:
-                if now - last_seen_game > 5 and now - launched_at > cfg["launch_timeout"]:
-                    log("Game is not running - launching it through Steam")
-                    os.startfile(STEAM_LAUNCH)
-                    launched_at = now
-                    nav.reset()
-                self._sleep(1)
-                continue
-            last_seen_game = now
-
-            if gl.state == "joining" and now - gl.since > cfg["join_timeout"]:
-                log("No join result for a while - checking the screen")
-                gl.state = "menu"
-            if gl.state == "menu" or (gl.state == "starting" and now - gl.since > 20):
-                try:
-                    nav.tick()
-                except OSError as e:
-                    log(f"Capture/OCR hiccup: {e}")
-                self._sleep(0.05)
+    def _on_event(self, ev):
+        """Reacts to a game event from the log. Returns True when the bot should stop."""
+        hk = self.cfg["hotkeys"]
+        self.events.append((time.time(), ev))
+        if self.safe_log_started and ev in ("left", "disconnected", "menu", "closed"):
+            self.safe_log_started, self.safe_log_tries = None, 0
+            self.paused = True
+            log(f"Safe-logged out. Paused - {hk['pause']} to rejoin.")
+        elif ev == "joining":
+            self.attempts += 1
+            self.join_started = time.time()
+            log(f"Attempt #{self.attempts}: connecting to {self.gl.server_ip}...")
+        elif ev == "join_failed":
+            took = time.time() - self.join_started if self.join_started else 0
+            log(f"Attempt #{self.attempts} rejected after {took:.1f}s (server full?) - retrying")
+        elif ev == "ingame":
+            log(f"IN GAME after {self.attempts} attempt(s).")
+            self.joins += 1
+            self.hud_seen_at = time.time()
+            if self.exit_on_join:
+                return True
+            self.attempts = 0
+        elif ev == "disconnected":
+            log("Disconnected from the server - rejoining")
+        elif ev == "left":
+            if self.cfg["rejoin_after_leave"]:
+                log("Left the server - rejoining")
             else:
-                self._sleep(0.1)
+                self.paused = True
+                log(f"You left the server yourself - paused ({hk['pause']} to rejoin).")
+        elif ev == "closed":
+            if not self.cfg["relaunch_after_quit"]:
+                self.paused = True
+                log(f"Game was closed normally - paused ({hk['pause']} to relaunch and rejoin).")
+        elif ev == "menu":
+            self.nav.reset()
+        return False
+
+    def _where(self):
+        """Where the game really is, judged from the screen: "ingame" (the HUD is showing),
+        "menu" (title screen or server list), or None."""
+        if any(v is not None for v in read_stats(self.game).values()):
+            return "ingame"
+        lines = self.ocr.read(self.game.capture(self.cfg.get("ocr_scale", 1.0)))
+        L = self.cfg["labels"]
+        if any(find_any(lines, L[key])[0] for key in ("browser", "to_browser", "any_key")):
+            return "menu"
+        return None
+
+    def _check_ingame(self, now):
+        """The log says in game. If the HUD has been gone for 2 minutes and the screen shows the
+        menu, a disconnect went unlogged (or unrecognised): treat it as one."""
+        if now - self.hud_checked_at < 30:
+            return
+        self.hud_checked_at = now
+        if any(v is not None for v in read_stats(self.game).values()):
+            self.hud_seen_at = now
+            return
+        if now - self.hud_seen_at < 120:
+            return
+        self.hud_seen_at = now  # look again in 2 minutes, not every pass
+        if self._where() == "menu":
+            log("The game's log says in game, but the screen shows the menu - treating it as a disconnect")
+            self.gl._set("menu")
+            self._on_event("disconnected")
+
+    def _clear_overlays(self, close_chat):
+        """Closes the pause menu, which blurs the HUD (wrong readings) and swallows keys, and if
+        close_chat also chat, which would take the safe-log keys as text. True if it closed one."""
+        game = self.game
+        image = game.capture()
+        if close_chat and chat_open(image):
+            log("Chat is open - clearing and closing it")
+            game.focus()
+            game.clear_line()
+            game.tap(VK_RETURN)
+            time.sleep(0.4)
+            return True
+        _, pos = find_any(self.ocr.read(image), self.cfg["labels"]["resume"])
+        if pos:
+            log("Pause menu is open - closing it (Resume)")
+            game.click(*pos)
+            time.sleep(0.6)
+            return True
+        return False
+
+    def _watch_stats(self, game, now):
+        """Safe-logs once hunger or thirst drops to its limit. After a safe-log a stat only counts
+        again once it has been seen above its limit, so rejoining while still hungry doesn't log
+        you straight back out."""
+        sl = self.cfg["safe_log"]
+        limits = {stat: sl[stat] for stat in STAT_ICONS if sl[stat] > 0}
+        if not limits or now - self.stats_at < 5:
+            return
+        self.stats_at = now
+        if self.safe_log_started:
+            if now - self.safe_log_started < 90:  # the server lets you out after 60 s asleep
+                return
+            if self.safe_log_tries >= 3:
+                self.safe_log_started, self.paused = None, True
+                log(f"Safe-log didn't work after 3 tries - paused. Is {sl['key']} your rest key?")
+                return
+            self._safe_log(game, "Still in game 90 s after safe-logging - trying again")
+            return
+        if now - self.overlay_at >= 30:
+            self.overlay_at = now
+            if self._clear_overlays(close_chat=False):
+                return  # read again next pass, with the HUD unblurred
+        try:
+            self.stats = read_stats(game)
+            # The icon estimate runs a few points off, so near a limit confirm with the exact tooltip
+            # value. That opens chat for a moment, so at most every 30 s.
+            near = [stat for stat, limit in limits.items() if stat in self.armed
+                    and self.stats.get(stat) is not None and 0 < self.stats[stat] <= limit + 5]
+            exact = {stat: 0 for stat in limits if self.stats.get(stat) == 0}  # empty: no tooltip, nothing to check
+            if near and now - self.exact_at >= 30:
+                self.exact_at = now
+                exact = read_exact(game, self.ocr, near)
+                self.stats.update(exact)
+                self.exact_ok.update({stat: now for stat in exact})
+        except OSError:
+            return
+        for stat, limit in limits.items():
+            value = self.stats.get(stat)
+            if value is None:
+                continue
+            if value > limit:
+                self.armed.add(stat)
+                self.low[stat] = 0
+            elif stat not in self.armed:
+                if stat not in self.low:
+                    log(f"{stat.capitalize()} is still at {value:g}% after the last safe-log - "
+                        f"auto safe-log for it restarts once it's above {limit}%")
+                    self.low[stat] = 0
+            elif stat in exact:
+                self._safe_log(game, f"{stat.capitalize()} at {value:g}% (limit {limit}%)")
+                return
+            elif now - self.exact_ok.get(stat, 0) > 60:  # tooltip unreadable: fall back on the icon
+                self.low[stat] = self.low.get(stat, 0) + 1
+                if self.low[stat] >= 3:  # three readings in a row, so a stray frame can't log you out
+                    self._safe_log(game, f"{stat.capitalize()} at about {value}% (limit {limit}%)")
+                    return
+
+    def _safe_log(self, game, why):
+        key = self.cfg["safe_log"]["key"]
+        log(f"{why} - safe-logging: resting ({key}), then holding {key} to sleep")
+        self._clear_overlays(close_chat=True)  # the keys must reach the dino, not chat or a menu
+        game.hold_key(key, 0.1)
+        time.sleep(2.5)  # let the rest animation finish
+        game.hold_key(key, float(self.cfg["safe_log"]["hold_seconds"]))
+        self.safe_log_started = time.time()
+        self.safe_log_tries += 1
+        self.armed.clear()  # rejoining still hungry mustn't log you straight back out
+        self.low.clear()
 
 
 def cmd_run(args):
@@ -1021,14 +1376,20 @@ BORDER, CONTROL, GRID = "#222224", "#3a3a3e", "#232327"
 TEXT, MUTED = "#ffffff", "#8a8c92"
 ACCENT, POSITIVE, NEGATIVE, WARNING = "#4a8ad6", "#44a282", "#e5566f", "#d9a441"
 SESSIONS = ["Official", "Unofficial", "Favourites", "History"]
+OCR_SCALES = [1.0, 1.5, 2.0, 2.5, 3.0]
+LABEL_NAMES = {  # what each group of button texts is for, in the order the bot meets them
+    "any_key": "Start screen prompt", "to_browser": "Way to the server list",
+    "browser": "Proof you're in the server list", "search": "Server name filter", "refresh": "Refresh",
+    "join": "Join button", "confirm": "Confirm a join", "dismiss": "Close a popup",
+}
 STRIP_SPAN = 30 * 60  # seconds of history in the attempt strip
 
 LOG_COLOURS = [  # first match wins; routine retries stay grey so a real problem stands out
     (MUTED, ("OCR:", "rejected after")),
     (POSITIVE, ("IN GAME", "Already in game")),
     (NEGATIVE, ("Disconnected", "Error", "not found", "already running", "hiccup", "No Windows OCR",
-                "Unknown hotkey")),
-    (WARNING, ("Paused", "paused", "Stopped", "launching", "already taken")),
+                "Unknown hotkey", "frozen", "Stuck")),
+    (WARNING, ("Paused", "paused", "Stopped", "launching", "already taken", "safe-log")),
 ]
 
 
@@ -1059,6 +1420,12 @@ def app_icon(size=64):
     for x, y in clear:
         img.transparency_set(x, y, True)
     return img
+
+
+def show_tab(items, name):
+    for n, (tab, line) in items.items():
+        tab.configure(text_color=TEXT if n == name else MUTED)
+        line.configure(bg=ACCENT if n == name else BORDER)
 
 
 def clock(seconds):
@@ -1109,8 +1476,8 @@ class App:
         except ImportError:
             sys.exit("The window needs customtkinter:  pip install customtkinter")
 
-        self.log_path = log_path
-        self.bot, self.thread, self.was_running = None, None, None
+        self.ctk, self.tk, self.log_path = ctk, tk, log_path
+        self.bot, self.thread, self.was_running, self.dialog = None, None, None, None
         self.hover_x, self.ticks = None, 0
         self.lines = queue.Queue()
         global log_sink
@@ -1159,6 +1526,27 @@ class App:
             return ctk.CTkButton(parent, text=text, command=command, width=0, height=28, corner_radius=14,
                                  font=font(13), fg_color="transparent", hover_color=RAISED, text_color=MUTED)
 
+        def underline_tabs(parent, options, on_pick):
+            """Options as underline tabs: the selection is a 1px accent line under its label, on a
+            full-width 1px rule. Returns the frame and {option: (label, line)} for show_tab()."""
+            tabs = ctk.CTkFrame(parent, fg_color="transparent")
+            tk.Frame(tabs, height=1, bg=BORDER).grid(row=1, column=0, columnspan=2 * len(options), sticky="ew")
+            tabs.grid_columnconfigure(2 * len(options) - 1, weight=1)
+            items = {}
+            for i, name in enumerate(options):
+                if i:
+                    tabs.grid_columnconfigure(2 * i - 1, minsize=px(18))
+                tab = ctk.CTkLabel(tabs, text=name, font=font(13), height=28, cursor="hand2")
+                tab.grid(row=0, column=2 * i, sticky="w")
+                tab.bind("<Button-1>", lambda e, n=name: on_pick(n))
+                line = tk.Frame(tabs, height=1, bg=BORDER)
+                line.grid(row=1, column=2 * i, sticky="ew")
+                items[name] = (tab, line)
+            return tabs, items
+
+        self.font, self.px, self.semi, self.mono = font, px, semi, mono
+        self.text_button, self.underline_tabs = text_button, underline_tabs
+
         root.grid_columnconfigure(0, weight=1)
         root.grid_rowconfigure(2, weight=1)
 
@@ -1172,10 +1560,12 @@ class App:
         ctk.CTkLabel(bar, text="Isle Auto-Connect", font=font(14, semi), text_color=TEXT).pack(side="left", padx=(10, 0))
         ctk.CTkLabel(bar, text="for The Isle: Evrima", font=font(13), text_color=MUTED).pack(side="left", padx=(8, 0))
         text_button(bar, "Config file", self.edit_config).pack(side="right", padx=(16, 0))
-        for key, what in ((self.hotkeys["pause"], "Pause"), (self.hotkeys["quit"], "Stop")):  # packed right to left
+        self.key_chips = {}
+        for action, what in (("pause", "Pause"), ("quit", "Stop")):  # packed right to left
             ctk.CTkLabel(bar, text=what, font=font(12), text_color=MUTED).pack(side="right", padx=(6, 14))
-            ctk.CTkLabel(bar, text=key, font=font(12, mono), text_color=TEXT, fg_color=RAISED,
-                         corner_radius=4, width=34, height=22).pack(side="right")
+            self.key_chips[action] = ctk.CTkLabel(bar, text=self.hotkeys[action], font=font(12, mono),
+                                                  text_color=TEXT, fg_color=RAISED, corner_radius=4, width=34, height=22)
+            self.key_chips[action].pack(side="right")
         tk.Frame(root, height=1, bg=BORDER).grid(row=1, column=0, sticky="ew")
 
         page = ctk.CTkFrame(root, fg_color="transparent")
@@ -1268,7 +1658,8 @@ class App:
         settings.grid_columnconfigure(0, weight=1)
         head = card_header(settings, "Settings")
         self.locked = ctk.CTkLabel(head, text="", font=font(12), text_color=MUTED, height=24)
-        self.locked.pack(side="right")
+        self.more_btn = text_button(head, "More settings", self.open_settings)
+        self.more_btn.pack(side="right")
 
         def label(text, row, top=14):
             ctk.CTkLabel(settings, text=text, font=font(13), text_color=MUTED, height=18, anchor="w").grid(
@@ -1283,24 +1674,10 @@ class App:
             self.server.insert(0, cfg["server"])
         self.server.bind("<Return>", lambda e: self.start_stop() if not self.running() else None)
 
-        # Session filter as underline tabs: the selection is a 1px accent line under its label,
-        # on a full-width 1px rule.
         label("Session filter", 3)
-        tabs = ctk.CTkFrame(settings, fg_color="transparent")
+        tabs, self.tabs = underline_tabs(settings, SESSIONS, self._pick_session)
         tabs.grid(row=4, column=0, sticky="ew", padx=20)
-        tk.Frame(tabs, height=1, bg=BORDER).grid(row=1, column=0, columnspan=2 * len(SESSIONS), sticky="ew")
-        tabs.grid_columnconfigure(2 * len(SESSIONS) - 1, weight=1)
         self.session = cfg["session_filter"]
-        self.tabs = {}
-        for i, name in enumerate(SESSIONS):
-            if i:
-                tabs.grid_columnconfigure(2 * i - 1, minsize=px(18))
-            tab = ctk.CTkLabel(tabs, text=name, font=font(13), height=28, cursor="hand2")
-            tab.grid(row=0, column=2 * i, sticky="w")
-            tab.bind("<Button-1>", lambda e, n=name: self._pick_session(n))
-            line = tk.Frame(tabs, height=1, bg=BORDER)
-            line.grid(row=1, column=2 * i, sticky="ew")
-            self.tabs[name] = (tab, line)
         self._pick_session(self.session)
 
         self.rejoin = ctk.BooleanVar(value=cfg["rejoin_after_leave"])
@@ -1319,6 +1696,21 @@ class App:
                                button_hover_color="#e6e6e6")
             sw.pack(side="right")
             self.switches.append(sw)
+
+        label("Auto safe-log at, 0 = off", 9, top=0)
+        limits = ctk.CTkFrame(settings, fg_color="transparent")
+        limits.grid(row=10, column=0, sticky="ew", padx=20, pady=(0, 18))
+        self.limits, self.readings = {}, {}
+        for i, stat in enumerate(STAT_ICONS):
+            ctk.CTkLabel(limits, text=stat.capitalize(), font=font(13), text_color=TEXT, height=34).grid(
+                row=0, column=3 * i, sticky="w", padx=(0 if i == 0 else 20, 8))
+            entry = ctk.CTkEntry(limits, width=48, height=34, corner_radius=6, font=font(13, mono), justify="right",
+                                 fg_color=RAISED, border_width=1, border_color=CONTROL, text_color=TEXT)
+            entry.insert(0, str(cfg["safe_log"][stat]))
+            entry.grid(row=0, column=3 * i + 1)
+            self.limits[stat] = entry
+            self.readings[stat] = ctk.CTkLabel(limits, text="%", font=font(12), text_color=MUTED, height=34)
+            self.readings[stat].grid(row=0, column=3 * i + 2, sticky="w", padx=(6, 0))
 
         self.server.bind("<KeyRelease>", lambda e: self._title())
         log("Ready.")
@@ -1343,7 +1735,18 @@ class App:
             log("Type part of the server's name first, as shown in the in-game server list.")
             self.server.focus_set()
             return
+        try:
+            limits = {stat: int(entry.get() or 0) for stat, entry in self.limits.items()}
+        except ValueError:
+            log("Safe-log levels are whole percents (0 turns one off).")
+            return
+        if not all(0 <= v <= 95 for v in limits.values()):
+            log("Safe-log levels run from 0 (off) to 95 %.")
+            return
         cfg = load_config(None)
+        cfg["safe_log"].update(limits)
+        if any(limits.values()):
+            log("Auto safe-log on: " + ", ".join(f"{s} at {v}%" for s, v in limits.items() if v))
         cfg.update(server=server, session_filter=self.session,
                    rejoin_after_leave=self.rejoin.get(), relaunch_after_quit=self.relaunch.get())
         save_config(cfg)
@@ -1355,10 +1758,147 @@ class App:
             self.bot.toggle_pause()
 
     def scan(self):
-        self._background(lambda: [log(line) for line in scan()])
+        self._background(lambda: [log(line) for line in scan(load_config(None)["ocr_scale"])])
 
     def edit_config(self):
         subprocess.Popen(["notepad.exe", CONFIG_PATH])
+
+    def open_settings(self):
+        """The settings that otherwise live only in isle_reconnect.json, in a window of their own."""
+        if self.running():
+            return
+        if self.dialog and self.dialog.winfo_exists():
+            self.dialog.focus()
+            return
+        ctk, tk, font, semi, mono = self.ctk, self.tk, self.font, self.semi, self.mono
+        cfg = load_config(None)
+        top = self.dialog = ctk.CTkToplevel(self.root, fg_color=GROUND)
+        top._iconbitmap_method_called = True  # keep the app's icon instead of customtkinter's
+        top.after(300, lambda: top.iconphoto(False, self.icon))
+        top.title("More settings")
+        top.transient(self.root)
+        top.geometry("600x700")
+        top.minsize(540, 480)
+        top.grid_columnconfigure(0, weight=1)
+        top.grid_rowconfigure(1, weight=1)
+
+        head = ctk.CTkFrame(top, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=32, pady=(24, 8))
+        ctk.CTkLabel(head, text="More settings", font=font(20, semi), text_color=TEXT, height=28).pack(anchor="w")
+        ctk.CTkLabel(head, text="Saved to isle_reconnect.json. They apply the next time you press Start.",
+                     font=font(13), text_color=MUTED, height=20).pack(anchor="w")
+
+        body = ctk.CTkScrollableFrame(top, fg_color="transparent", corner_radius=0,
+                                      scrollbar_button_color=RAISED, scrollbar_button_hover_color=CONTROL)
+        body.grid(row=1, column=0, sticky="nsew", padx=(24, 8))
+        body.grid_columnconfigure(0, weight=1)
+        rows = iter(range(1000))
+
+        def section(title, note):
+            ctk.CTkLabel(body, text=title, font=font(16, semi), text_color=TEXT, height=24, anchor="w").grid(
+                row=next(rows), column=0, sticky="w", padx=8, pady=(20, 0))
+            ctk.CTkLabel(body, text=note, font=font(13), text_color=MUTED, anchor="w", justify="left",
+                         wraplength=480).grid(row=next(rows), column=0, sticky="w", padx=8, pady=(2, 8))
+
+        def setting(text):
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.grid(row=next(rows), column=0, sticky="ew", padx=8, pady=3)
+            ctk.CTkLabel(row, text=text, font=font(13), text_color=TEXT, height=34).pack(side="left")
+            return row
+
+        def number(row, value, unit):
+            ctk.CTkLabel(row, text=unit, font=font(13), text_color=MUTED, width=16).pack(side="right", padx=(8, 0))
+            entry = ctk.CTkEntry(row, width=72, height=34, corner_radius=6, font=font(13, mono), justify="right",
+                                 fg_color=RAISED, border_width=1, border_color=CONTROL, text_color=TEXT)
+            entry.insert(0, str(value))
+            entry.pack(side="right")
+            return entry
+
+        section("Hotkeys", "Global keys that work while the game has focus.")
+        keys = {}
+        for action, text in (("quit", "Stop the bot"), ("pause", "Pause or resume")):
+            keys[action] = ctk.StringVar(value=cfg["hotkeys"][action].upper())
+            ctk.CTkOptionMenu(setting(text), values=list(KEY_NAMES), variable=keys[action], width=120, height=34,
+                              corner_radius=6, font=font(13, mono), dropdown_font=font(13, mono),
+                              fg_color=RAISED, button_color=RAISED, button_hover_color=CONTROL, text_color=TEXT,
+                              dropdown_fg_color=RAISED, dropdown_hover_color=CONTROL,
+                              dropdown_text_color=TEXT).pack(side="right")
+
+        section("Timing", "How long the bot waits before it stops trusting the game's log.")
+        join_timeout = number(setting("Check the screen again after no join result for"), cfg["join_timeout"], "s")
+        launch_timeout = number(setting("Wait for a relaunched game for"), cfg["launch_timeout"], "s")
+
+        section("Screen reading", "Screenshots are enlarged before OCR. Larger reads the server list's small "
+                                  "font better, but each pass is slower.")
+        scales = sorted(set(OCR_SCALES) | {float(cfg["ocr_scale"])})
+        names = {f"{v:g}×": v for v in scales}
+        scale = {"value": float(cfg["ocr_scale"])}
+
+        def pick_scale(name):
+            scale["value"] = names[name]
+            show_tab(scale_tabs, name)
+
+        tabs, scale_tabs = self.underline_tabs(body, list(names), pick_scale)
+        tabs.grid(row=next(rows), column=0, sticky="w", padx=8, pady=(0, 4))
+        pick_scale(f"{scale['value']:g}×")
+
+        section("Button texts", "The bot finds buttons by their text. If the game renames one, add the new "
+                                "text here; separate several with commas. Yours are tried before the built-in ones.")
+        texts = {}
+        for key, name in LABEL_NAMES.items():
+            built_in = DEFAULT_CONFIG["labels"][key]
+            yours = [w for w in cfg["labels"].get(key, []) if w not in built_in]
+            ctk.CTkLabel(body, text=name, font=font(13), text_color=TEXT, height=20, anchor="w").grid(
+                row=next(rows), column=0, sticky="w", padx=8, pady=(8, 4))
+            texts[key] = ctk.CTkEntry(body, height=34, corner_radius=6, font=font(13), fg_color=RAISED,
+                                      border_width=1, border_color=CONTROL, text_color=TEXT,
+                                      placeholder_text="none of your own", placeholder_text_color=MUTED)
+            if yours:
+                texts[key].insert(0, ", ".join(yours))
+            texts[key].grid(row=next(rows), column=0, sticky="ew", padx=8)
+            ctk.CTkLabel(body, text="Built in: " + ", ".join(built_in), font=font(12), text_color=MUTED,
+                         anchor="w", justify="left", wraplength=480).grid(row=next(rows), column=0, sticky="w",
+                                                                          padx=8, pady=(4, 0))
+        ctk.CTkFrame(body, fg_color="transparent", height=16).grid(row=next(rows), column=0)
+
+        tk.Frame(top, height=1, bg=BORDER).grid(row=2, column=0, sticky="ew")
+        foot = ctk.CTkFrame(top, fg_color="transparent")
+        foot.grid(row=3, column=0, sticky="ew", padx=32, pady=16)
+        self.text_button(foot, "Open config file", self.edit_config).pack(side="left")
+
+        def save():
+            if keys["quit"].get() == keys["pause"].get():
+                return error.configure(text="Stop and pause need different keys.")
+            try:
+                waits = int(join_timeout.get()), int(launch_timeout.get())
+            except ValueError:
+                return error.configure(text="Waits are whole seconds.")
+            if not (10 <= waits[0] <= 3600 and 30 <= waits[1] <= 3600):
+                return error.configure(text="Waits run from 10 s (30 s for a relaunch) to 3600 s.")
+            cfg = load_config(None)  # fresh, so nothing the main window saved since is lost
+            cfg["hotkeys"] = {action: var.get() for action, var in keys.items()}
+            cfg["join_timeout"], cfg["launch_timeout"] = waits
+            cfg["ocr_scale"] = scale["value"]
+            for key, entry in texts.items():
+                words = [w.strip() for w in entry.get().split(",") if w.strip()]
+                seen = {w.upper() for w in words}
+                cfg["labels"][key] = words + [w for w in DEFAULT_CONFIG["labels"][key] if w.upper() not in seen]
+            save_config(cfg)
+            self.hotkeys = cfg["hotkeys"]
+            for action, chip in self.key_chips.items():
+                chip.configure(text=self.hotkeys[action])
+            log("Settings saved.")
+            top.destroy()
+
+        pill = dict(height=34, corner_radius=17, font=font(13, semi), border_width=1)
+        ctk.CTkButton(foot, text="Save", command=save, width=92, fg_color=TEXT, hover_color="#e2e2e4",
+                      border_color=TEXT, text_color="#000000", **pill).pack(side="right")
+        ctk.CTkButton(foot, text="Cancel", command=top.destroy, width=92, fg_color="transparent",
+                      hover_color=RAISED, border_color=CONTROL, text_color=TEXT, **pill).pack(side="right", padx=(0, 10))
+        error = ctk.CTkLabel(foot, text="", font=font(12), text_color=NEGATIVE, height=34)
+        error.pack(side="right", padx=(0, 16))
+        top.bind("<Escape>", lambda e: top.destroy())
+        top.after(150, lambda: (top.lift(), top.focus_force(), top.grab_set()))  # modal once it's on screen
 
     def clear(self):
         self.view.configure(state="normal")
@@ -1375,9 +1915,7 @@ class App:
         if self.running():
             return
         self.session = name
-        for n, (tab, line) in self.tabs.items():
-            tab.configure(text_color=TEXT if n == name else MUTED)
-            line.configure(bg=ACCENT if n == name else BORDER)
+        show_tab(self.tabs, name)
 
     def _background(self, work):
         def guarded():
@@ -1474,6 +2012,10 @@ class App:
             self.kpi[key][0].configure(text=v, text_color=TEXT if v != "–" else MUTED)
             self.kpi[key][1].configure(text=s)
 
+        for stat, reading in self.readings.items():  # what the bot last read from the HUD
+            value = bot.stats.get(stat) if running and bot else None
+            reading.configure(text="%" if value is None else f"%  now {value:g}%")
+
         self.pause_btn.configure(text="Resume" if running and bot.paused else "Pause")
         if running != self.was_running:  # settings are locked while the bot uses them
             self.was_running = running
@@ -1488,9 +2030,13 @@ class App:
                                   text_color=MUTED if running else TEXT)
             for sw in self.switches:
                 sw.configure(state="disabled" if running else "normal")
+            for entry in self.limits.values():
+                entry.configure(state="disabled" if running else "normal", text_color=MUTED if running else TEXT)
             for tab, _ in self.tabs.values():
                 tab.configure(cursor="arrow" if running else "hand2")
             self.locked.configure(text="Locked while running" if running else "")
+            (self.more_btn if running else self.locked).pack_forget()
+            (self.locked if running else self.more_btn).pack(side="right")
             self._title()
         self.ticks += 1
         if self.ticks % 5 == 0:
@@ -1589,9 +2135,11 @@ def main():
     r.add_argument("--debug", action="store_true", help="print what OCR reads each pass")
     sub.add_parser("scan", help="OCR the game window once and print the text found")
     sub.add_parser("status", help="show the game state from the log")
+    sub.add_parser("stats", help="read hunger and thirst from the HUD once")
     sub.add_parser("stop", help="stop a running bot (no hotkey needed)")
     args = p.parse_args()
-    commands = {"run": cmd_run, "scan": cmd_scan, "status": cmd_status, "stop": cmd_stop, "gui": cmd_gui}
+    commands = {"run": cmd_run, "scan": cmd_scan, "status": cmd_status, "stop": cmd_stop, "stats": cmd_stats,
+                "gui": cmd_gui}
     commands[args.cmd or "gui"](args)
 
 

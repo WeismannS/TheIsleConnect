@@ -42,6 +42,9 @@
       "REFRESH",
       "SERVER NAME FILTER"
     ],
+    "resume": [
+      "RESUME"
+    ],
     "to_browser": [
       "PLAY",
       "SERVER BROWSER",
@@ -59,5 +62,11 @@
   "join_timeout": 90,
   "launch_timeout": 240,
   "rejoin_after_leave": false,
-  "relaunch_after_quit": false
+  "relaunch_after_quit": false,
+  "safe_log": {
+    "hunger": 0,
+    "thirst": 0,
+    "key": "H",
+    "hold_seconds": 2.0
+  }
 }
